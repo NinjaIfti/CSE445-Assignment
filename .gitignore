@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# NOTE: logs/ is deliberately NOT ignored. The assignment requires the recorded
+# execution traces (logs/*.log, logs/*.json, logs/TRACES.md) to be submitted.
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

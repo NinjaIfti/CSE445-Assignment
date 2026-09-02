@@ -1,0 +1,25 @@
+# CSE445 Assignment 3 -- Autonomous Local LLM ML Agent
+# Install with:  pip install -r requirements.txt
+#
+# NOTE ON PYTORCH
+# torch is listed here for completeness, but the wheel you want depends on your hardware
+# and pip cannot infer it. setup_wsl.sh installs it first from the correct index:
+#   CPU only          pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   CUDA 12.8 (Ada/Blackwell, e.g. RTX 40xx/50xx)
+#                     pip install torch --index-url https://download.pytorch.org/whl/cu128
+#   CUDA 12.1 (older) pip install torch --index-url https://download.pytorch.org/whl/cu121
+# Installing torch from the default PyPI index gives a CPU build on Linux.
+
+# Classical ML
+scikit-learn>=1.4,<2.0
+pandas>=2.0
+numpy>=1.26
+
+# Deep learning
+torch>=2.2
+
+# Transport to the local Ollama REST API
+requests>=2.31
+
+# Test suite (offline; needs no LLM)
+pytest>=8.0
