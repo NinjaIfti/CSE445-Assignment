@@ -109,8 +109,12 @@ class RunRecord:
     steps: List[StepRecord] = field(default_factory=list)
     final_answer: Optional[str] = None
     completed: bool = False
+    forced_final: bool = False   # answer was compelled after a stall, not volunteered
     repairs: int = 0
     parse_errors: int = 0
+    grounding: Optional[Dict[str, Any]] = None   # audit of the numbers in the answer
+    grounding_rejections: int = 0                # invented answers sent back for rework
+    rejected_answer: Optional[str] = None        # forced answer refused as ungrounded
     total_seconds: float = 0.0
 
     def latency_summary(self) -> Dict[str, float]:
@@ -143,18 +147,24 @@ class OllamaClient:
                  temperature: float = 0.1, timeout: int = 300):
         self.model, self.url, self.temperature, self.timeout = model, url, temperature, timeout
 
-    def __call__(self, prompt: str) -> Tuple[str, Dict[str, Any]]:
+    # Stopping at "Observation:" is what prevents the model from hallucinating tool output
+    # and continuing the conversation on its own. It must be disabled for the forced-final
+    # call, where "Observation" is the first thing the model tries to write and would
+    # otherwise truncate the answer to an empty string.
+    DEFAULT_STOP = ["Observation:", "\nObservation"]
+
+    def __call__(self, prompt: str,
+                 stop: Optional[List[str]] = None) -> Tuple[str, Dict[str, Any]]:
+        options: Dict[str, Any] = {"temperature": self.temperature, "num_predict": 512}
+        stop_sequences = self.DEFAULT_STOP if stop is None else stop
+        if stop_sequences:
+            options["stop"] = stop_sequences
+
         payload = {
             "model": self.model,
             "prompt": prompt,
             "stream": False,
-            "options": {
-                "temperature": self.temperature,
-                # Stopping at "Observation:" is what prevents the model from hallucinating
-                # tool output and continuing the conversation on its own.
-                "stop": ["Observation:", "\nObservation"],
-                "num_predict": 512,
-            },
+            "options": options,
         }
         try:
             response = requests.post(self.url, json=payload, timeout=self.timeout)
@@ -356,6 +366,78 @@ _PARSE_REMINDER = (
 )
 
 
+# --------------------------------------------------------------------------------------
+# Grounding audit: catching invented numbers
+# --------------------------------------------------------------------------------------
+_NUMBER_RE = re.compile(r"-?\d+\.\d+")
+
+
+def audit_grounding(answer: str, observations: List[str]) -> Dict[str, Any]:
+    """Check that every decimal number in the answer actually came from an Observation.
+
+    Small models will happily produce a complete, well-formatted results table having run
+    none of the experiments. The output looks authoritative and is entirely invented --
+    which is far more damaging than a crash, because nothing about it signals failure.
+
+    Rounding is allowed: an answer reporting 0.96 is grounded by an observation of 0.9561,
+    so each claimed value is compared at its own stated precision.
+    """
+    observed: List[float] = []
+    for obs in observations:
+        observed.extend(float(m) for m in _NUMBER_RE.findall(obs))
+
+    claimed = _NUMBER_RE.findall(answer)
+    ungrounded = []
+    for token in claimed:
+        value = float(token)
+        decimals = len(token.split(".")[1])
+        # Direct match at the precision the answer chose to state.
+        if any(abs(round(o, decimals) - value) < 1e-9 for o in observed):
+            continue
+        # Accuracies are stored as proportions but frequently reported as percentages,
+        # so 97.42 is a faithful rendering of an observed 0.9742, not an invention.
+        if any(abs(round(o * 100, decimals) - value) < 1e-9 for o in observed):
+            continue
+        ungrounded.append(token)
+
+    return {
+        "numbers_claimed": len(claimed),
+        "numbers_ungrounded": len(ungrounded),
+        "ungrounded_values": ungrounded[:12],
+        "grounded_ratio": round(1 - len(ungrounded) / len(claimed), 3) if claimed else 1.0,
+    }
+
+
+def is_fabricated(audit: Dict[str, Any]) -> bool:
+    """Treat an answer as fabricated only when the evidence is unambiguous.
+
+    One stray number is a rounding artefact or an arithmetic slip, so a single unmatched
+    value is tolerated. Two situations are not:
+
+      * three or more unaccounted values with most of the answer ungrounded -- an
+        invented results table;
+      * *nothing* grounded at all across two or more values -- an answer reporting
+        experiments that were never run. This case matters even at two numbers: a stalled
+        run that never trained a model still confidently reported two model accuracies.
+    """
+    if audit["numbers_claimed"] >= 2 and audit["grounded_ratio"] == 0.0:
+        return True
+    # Note the inclusive bound. A real answer sat at exactly 0.5 -- seven invented values
+    # out of fourteen -- and a strict "< 0.5" let it through as acceptable.
+    return audit["numbers_ungrounded"] >= 3 and audit["grounded_ratio"] <= 0.5
+
+
+_REGROUND_DEMAND = (
+    "\nObservation: [GROUNDING REJECTED] Your Final Answer reported {n} numbers that "
+    "appear in no Observation from this run: {values}. You did not run the experiments "
+    "that would produce them, so those figures are invented and cannot be submitted.\n"
+    "You have executed {done} successful tool call(s) so far. Continue the ReAct loop: "
+    "issue the Action needed for the next missing experiment. Only once every required "
+    "Observation is present may you write a Final Answer, and it must use those "
+    "Observation values verbatim.\n"
+)
+
+
 def _build_repair_hint(observation_json: str, attempts: int) -> Optional[str]:
     """Turn a failed tool Observation into an explicit corrective instruction."""
     try:
@@ -388,12 +470,16 @@ class ReActAgent:
         model: str = MODEL_NAME,
         max_iterations: int = 12,
         max_repairs_per_signature: int = 3,
+        max_unproductive_steps: int = 3,
+        max_grounding_rejections: int = 2,
         verbose: bool = True,
     ):
         self.llm = llm or OllamaClient(model=model)
         self.model = model
         self.max_iterations = max_iterations
         self.max_repairs_per_signature = max_repairs_per_signature
+        self.max_unproductive_steps = max_unproductive_steps
+        self.max_grounding_rejections = max_grounding_rejections
         self.verbose = verbose
         self.system_prompt = SYSTEM_PROMPT_TEMPLATE.format(tool_catalogue=describe_tools())
 
@@ -401,6 +487,94 @@ class ReActAgent:
     def _say(self, text: str = "") -> None:
         if self.verbose:
             print(text, flush=True)
+
+    @staticmethod
+    def _evidence(record: RunRecord) -> List[str]:
+        """Observations that count as evidence when auditing an answer's numbers.
+
+        A rejected answer's own audit is recorded as that step's observation, and it
+        necessarily quotes the invented values. Feeding it back would let a fabricated
+        table validate itself on the next pass, so those steps are excluded.
+        """
+        return [s.observation for s in record.steps
+                if s.observation and s.event != "grounding_rejected"]
+
+    # -- forced termination ------------------------------------------------------------
+    def _force_final_answer(self, prompt: str,
+                            observations: Optional[List[str]] = None
+                            ) -> Tuple[str, Dict[str, Any]]:
+        """Compel a Final Answer by pre-filling the start of the model's turn.
+
+        Small models get stuck in action loops: they re-issue a call whose result they
+        already have, ignore the "you already ran this" note, and burn the whole budget
+        without ever concluding. Asking more politely does not fix it.
+
+        Instead of asking, this appends the opening of the answer itself to the prompt.
+        Because /api/generate simply continues the text it is given, the model has no
+        syntactic room left to emit another Action -- it can only write the answer. The
+        observations already gathered are still in the scratchpad, so the answer stays
+        grounded in real tool output rather than invented numbers.
+        """
+        observations = observations or []
+
+        # Enumerating the numbers the model is permitted to use is far more effective than
+        # telling it not to invent any. It turns an open-ended generation into a selection.
+        allowed = sorted({m for obs in observations for m in _NUMBER_RE.findall(obs)},
+                         key=float)
+        allowed_clause = (
+            f"The ONLY numeric values you may quote are: {', '.join(allowed[:40])}. "
+            "You may express them as percentages, but you may not introduce any other "
+            "number.\n" if allowed else ""
+        )
+
+        instruction = (
+            "\n[SYSTEM] Tool use is now closed. You already have every Observation you "
+            "need, and no further Action will be executed. Answer the user's question in "
+            "plain English, in two to five sentences. Do NOT output JSON. Do NOT copy an "
+            "Observation verbatim. Do NOT write another Action.\n"
+            + allowed_clause +
+            "Thought: I have gathered all necessary experimental data.\n"
+        )
+
+        text, meta = self._ask_for_answer(prompt + instruction + "Final Answer:")
+
+        # A tired 3B model often ignores the prose instruction and simply echoes the
+        # observation JSON. Detecting that is trivial, and one retry whose pre-fill starts
+        # the sentence for it ("In plain English,") reliably produces real prose.
+        if text.startswith("{") or text.startswith("["):
+            retry, meta = self._ask_for_answer(
+                prompt + instruction + "Final Answer: In plain English,"
+            )
+            if retry and not retry.startswith(("{", "[")):
+                text = "In plain English, " + retry if not retry[0].isupper() else retry
+
+        return text, meta
+
+    def _ask_for_answer(self, full_prompt: str) -> Tuple[str, Dict[str, Any]]:
+        """One forced-answer generation, with the protocol scaffolding cleaned off."""
+        # The "Observation:" stop sequence must be lifted here. Left on, the model's first
+        # instinct after the pre-filled "Final Answer:" is to write another Observation
+        # block, which trips the stop immediately and yields an empty answer.
+        try:
+            text, meta = self.llm(full_prompt, stop=[])
+        except TypeError:
+            # A caller-supplied llm that does not accept a stop override (e.g. a test stub).
+            text, meta = self.llm(full_prompt)
+
+        # Strip anything the model bolts on after wandering back into protocol text.
+        for marker in ("\nObservation:", "\nAction:", "\nThought:", "[SYSTEM]"):
+            if marker in text:
+                text = text.split(marker)[0]
+        text = text.strip()
+        # With the stop sequence lifted, the model often opens with a stray "Observation:"
+        # label before the answer itself. Drop the label, keep the content.
+        if text.lower().startswith("observation:"):
+            text = text.split(":", 1)[1].strip()
+        # It also closes the pre-filled line with punctuation and then restates the header,
+        # producing answers that begin with a stray full stop and a second "Final Answer:".
+        if "Final Answer:" in text:
+            text = text.split("Final Answer:", 1)[1]
+        return text.strip().lstrip(".:,;- \n\t").strip(), meta
 
     # -- main loop ---------------------------------------------------------------------
     def run(self, task: str) -> RunRecord:
@@ -412,6 +586,9 @@ class ReActAgent:
         # failure mode of small models and would otherwise burn the whole iteration budget.
         cache: Dict[str, str] = {}
         repair_counts: Dict[str, int] = {}
+        # Steps that produced no new information: a cached repeat, a protocol violation,
+        # or a call that failed again. A run of these means the model is stuck.
+        unproductive = 0
 
         self._say("=" * 78)
         self._say(f"USER QUERY: {task}")
@@ -437,14 +614,42 @@ class ReActAgent:
             parsed = parse_llm_output(llm_output)
             step.thought = parsed["thought"]
 
-            # 1. Terminal state.
+            # 1. Terminal state -- but only if the numbers in it are real.
             if parsed["final_answer"]:
+                answer = parsed["final_answer"]
+                audit = audit_grounding(answer, self._evidence(record))
+                record.grounding = audit
+
+                if (is_fabricated(audit)
+                        and record.grounding_rejections < self.max_grounding_rejections):
+                    # The model wrote a results table for experiments it never ran.
+                    # Refuse it and send it back to the loop rather than logging fiction.
+                    record.grounding_rejections += 1
+                    step.event = "grounding_rejected"
+                    step.final_answer = answer
+                    step.observation = json.dumps(audit)
+                    record.steps.append(step)
+                    demand = _REGROUND_DEMAND.format(
+                        n=audit["numbers_ungrounded"],
+                        values=", ".join(audit["ungrounded_values"]),
+                        done=len(cache),
+                    )
+                    prompt += demand
+                    self._say(demand.strip())
+                    unproductive = 0  # give it a genuine chance to run the experiments
+                    continue
+
                 step.event = "final_answer"
-                step.final_answer = parsed["final_answer"]
+                step.final_answer = answer
                 record.steps.append(step)
-                record.final_answer = parsed["final_answer"]
+                record.final_answer = answer
                 record.completed = True
-                self._say("\n>>> Task completed successfully.")
+                if is_fabricated(audit):
+                    self._say(f"\n>>> Task completed, but the answer is NOT grounded: "
+                              f"{audit['numbers_ungrounded']}/{audit['numbers_claimed']} "
+                              f"numbers appear in no Observation.")
+                else:
+                    self._say("\n>>> Task completed successfully.")
                 break
 
             # 2. Protocol violation -> reformat instruction, no tool executed.
@@ -458,6 +663,9 @@ class ReActAgent:
                 prompt += nudge
                 record.steps.append(step)
                 self._say(nudge.strip())
+                unproductive += 1
+                if unproductive >= self.max_unproductive_steps:
+                    break
                 continue
 
             tool_name = parsed["action"]
@@ -469,14 +677,25 @@ class ReActAgent:
             if signature in cache:
                 step.event = "cached"
                 step.observation = cache[signature]
+                # Telling the model what it has NOT done yet is far more useful than
+                # telling it to stop doing what it just did.
+                used = {sig.split("::")[0] for sig in cache}
+                unused = [t for t in TOOL_SPECS if t not in used]
                 observation = (
                     f"\nObservation: {cache[signature]}\n"
-                    "[NOTE] This exact call was already executed earlier in this run. Do not "
-                    "repeat it again. Either call a different tool or give your Final Answer.\n"
+                    "[NOTE] This exact call was already executed earlier in this run and "
+                    "produced the result above. Calling it again cannot tell you anything "
+                    "new.\n"
+                    + (f"Tools you have NOT yet used: {unused}. If the task still needs "
+                       "one of them, call it now.\n" if unused else "")
+                    + "Otherwise give your Final Answer using the Observations above.\n"
                 )
                 prompt += observation
                 record.steps.append(step)
                 self._say(observation.strip())
+                unproductive += 1
+                if unproductive >= self.max_unproductive_steps:
+                    break
                 continue
 
             # 4. Execute the tool.
@@ -505,8 +724,10 @@ class ReActAgent:
                         "retrying it. Use a different tool or different arguments, or give "
                         "your Final Answer using the results you already have."
                     )
+                unproductive += 1
             else:
                 cache[signature] = result
+                unproductive = 0  # genuine new information: the model is making progress
 
             observation = f"\nObservation: {result}\n"
             if repair_hint:
@@ -514,9 +735,63 @@ class ReActAgent:
                 self._say(repair_hint)
             prompt += observation
             record.steps.append(step)
-        else:
-            self._say(f"\n>>> Iteration budget ({self.max_iterations}) exhausted "
-                      "without a Final Answer.")
+            if unproductive >= self.max_unproductive_steps:
+                break
+
+        # The loop ended without the model volunteering a Final Answer -- either it stalled
+        # or it ran out of iterations. Rather than abandoning a run whose Observations are
+        # perfectly good, compel the conclusion it would not write on its own.
+        if not record.completed:
+            reason = ("stalled after "
+                      f"{unproductive} unproductive steps" if unproductive >= self.max_unproductive_steps
+                      else f"exhausted its {self.max_iterations}-iteration budget")
+            self._say(f"\n>>> Agent {reason}. Forcing a Final Answer from the "
+                      "observations already collected.")
+
+            step = StepRecord(step=len(record.steps) + 1, event="forced_final")
+            call_start = time.perf_counter()
+            answer, meta = self._force_final_answer(prompt, self._evidence(record))
+            step.llm_seconds = round(time.perf_counter() - call_start, 3)
+            step.eval_count = int(meta.get("eval_count", 0))
+            step.tokens_per_second = float(meta.get("tokens_per_second", 0.0))
+            step.raw_output = answer
+            step.final_answer = answer
+            record.steps.append(step)
+
+            evidence = self._evidence(record)
+            audit = audit_grounding(answer, evidence) if answer else None
+
+            # A forced answer gets no second lap round the loop, so it is verified here.
+            # One retry with the constraint restated; a stalled run that never trained a
+            # model will otherwise still report two confident model accuracies.
+            if answer and is_fabricated(audit):
+                self._say(">>> Forced answer failed the grounding audit "
+                          f"({audit['ungrounded_values']}). Retrying once.")
+                record.grounding_rejections += 1
+                answer, meta = self._force_final_answer(prompt, evidence)
+                step.raw_output = answer
+                step.final_answer = answer
+                audit = audit_grounding(answer, evidence) if answer else None
+
+            record.grounding = audit
+            if answer and not is_fabricated(audit):
+                record.final_answer = answer
+                record.completed = True
+                record.forced_final = True
+                self._say(f"\nFinal Answer: {answer}")
+                self._say("\n>>> Task completed via forced finalisation.")
+            elif answer:
+                # Refuse to present invented results as the run's answer. The text is kept
+                # in the record so the failure is auditable, but the run is not "completed".
+                record.rejected_answer = answer
+                record.completed = False
+                step.event = "grounding_rejected"
+                self._say(f"\n>>> REJECTED (ungrounded): {answer}")
+                self._say(">>> Run did not produce a trustworthy answer: "
+                          f"{audit['numbers_ungrounded']}/{audit['numbers_claimed']} "
+                          "reported numbers appear in no Observation.")
+            else:
+                self._say("\n>>> Forced finalisation produced no answer.")
 
         record.total_seconds = round(time.perf_counter() - run_start, 3)
         return record
@@ -538,8 +813,12 @@ def save_run(record: RunRecord, log_dir: Path = LOG_DIR, label: str = "trace") -
         f"Task      : {record.task}",
         f"Model     : {record.model}",
         f"Started   : {record.started_at}",
-        f"Completed : {record.completed}   Steps: {len(record.steps)}   "
-        f"Repairs: {record.repairs}   Parse errors: {record.parse_errors}",
+        f"Completed : {record.completed}"
+        f"{' (forced finalisation)' if record.forced_final else ''}   "
+        f"Steps: {len(record.steps)}   "
+        f"Repairs: {record.repairs}   Parse errors: {record.parse_errors}   "
+        f"Grounding rejections: {record.grounding_rejections}",
+        f"Grounding : {json.dumps(record.grounding) if record.grounding else 'n/a'}",
         "=" * 78,
     ]
     for step in record.steps:

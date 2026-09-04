@@ -17,6 +17,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from react_agent import (  # noqa: E402
+    audit_grounding,
+    is_fabricated,
     ReActAgent,
     _build_repair_hint,
     parse_action_input,
@@ -31,9 +33,11 @@ class ScriptedLLM:
     def __init__(self, turns: List[str]):
         self.turns = list(turns)
         self.prompts: List[str] = []
+        self.stop_overrides: List[Any] = []
 
-    def __call__(self, prompt: str) -> Tuple[str, Dict[str, Any]]:
+    def __call__(self, prompt: str, stop: Any = None) -> Tuple[str, Dict[str, Any]]:
         self.prompts.append(prompt)
+        self.stop_overrides.append(stop)
         if not self.turns:
             return "Thought: done.\nFinal Answer: out of scripted turns.", {}
         return self.turns.pop(0), {"eval_count": 42, "tokens_per_second": 25.0}
@@ -199,10 +203,13 @@ def test_repair_budget_stops_an_endlessly_failing_call():
            'Action Input: {"dataset_name": "titanic"}')
     a, llm = agent([bad] * 6, max_repairs_per_signature=2, max_iterations=6)
     record = a.run("Summarise titanic.")
-    assert record.completed is False
-    assert record.repairs == 6
-    # Once the budget is spent the agent stops offering a retry_with and says so.
+    # Three consecutive failures trip the stall detector, so the loop stops early
+    # rather than spending the full six iterations on a call that cannot succeed.
+    assert record.repairs == 3
+    # Once the repair budget is spent the agent stops offering a retry_with and says so.
     assert "has now failed 3 times" in llm.prompts[-1]
+    # A run with nothing but failures still terminates through forced finalisation.
+    assert record.forced_final is True
 
 
 def test_identical_successful_call_is_served_from_cache():
@@ -249,10 +256,100 @@ def test_hallucinated_tool_name_is_survivable():
 def test_iteration_budget_is_enforced():
     turn = ('Thought: loop.\nAction: load_dataset_summary\n'
             'Action Input: {"dataset_name": "iris"}')
-    a, _ = agent([turn] * 10, max_iterations=3)
+    a, _ = agent([turn] * 10, max_iterations=3, max_unproductive_steps=99)
     record = a.run("Loop forever.")
-    assert record.completed is False
-    assert len(record.steps) == 3
+    # Exactly max_iterations reasoning steps, plus the single forced-final step.
+    assert [s.event for s in record.steps] == ["action", "cached", "cached", "forced_final"]
+    assert record.forced_final is True
+
+
+# --------------------------------------------------------------------------------------
+# Forced finalisation: the stall-breaker
+# --------------------------------------------------------------------------------------
+def test_forced_finalisation_rescues_a_stalled_run():
+    """The real llama3.2:3b failure: it re-calls a tool it already ran and never concludes."""
+    same = ('Thought: summarise.\nAction: load_dataset_summary\n'
+            'Action Input: {"dataset_name": "iris"}')
+    a, _ = agent([same, same, same, same,
+                  " iris has 150 samples, 4 features and 3 balanced classes."],
+                 max_iterations=8)
+    record = a.run("Describe iris.")
+
+    # One real call, then three cached repeats trip the stall detector.
+    assert [s.event for s in record.steps] == [
+        "action", "cached", "cached", "cached", "forced_final"]
+    assert record.completed is True
+    assert record.forced_final is True
+    assert record.final_answer == "iris has 150 samples, 4 features and 3 balanced classes."
+
+
+def test_forced_final_prompt_prefills_the_answer_opening():
+    """Pre-filling 'Final Answer:' leaves the model no room to emit another Action."""
+    same = ('Thought: go.\nAction: load_dataset_summary\n'
+            'Action Input: {"dataset_name": "iris"}')
+    a, llm = agent([same] * 4 + [" done."], max_iterations=8)
+    a.run("Describe iris.")
+
+    closing = llm.prompts[-1]
+    assert closing.rstrip().endswith("Final Answer:")
+    assert "Tool use is now closed" in closing
+    # The observations gathered earlier are still present, so the answer stays grounded.
+    assert '"n_samples": 150' in closing
+    # The Observation stop sequence must be lifted, or the answer comes back empty.
+    assert llm.stop_overrides[-1] == []
+    assert llm.stop_overrides[0] is None
+
+
+def test_forced_final_retries_when_the_model_echoes_observation_json():
+    """A JSON dump is not an answer. One retry with a prose pre-fill must replace it."""
+    same = ('Thought: go.\nAction: load_dataset_summary\n'
+            'Action Input: {"dataset_name": "iris"}')
+    a, llm = agent([same] * 4 + [
+        '{"status": "ok", "n_samples": 150}',                 # lazy echo
+        " iris has 150 samples across 3 balanced classes.",   # the retry
+    ], max_iterations=8)
+    record = a.run("Describe iris.")
+
+    assert record.final_answer == "In plain English, iris has 150 samples across 3 balanced classes."
+    # The retry pre-fills the opening of the sentence to block another JSON dump.
+    assert llm.prompts[-1].rstrip().endswith("Final Answer: In plain English,")
+
+
+def test_forced_final_accepts_good_prose_without_retrying():
+    same = ('Thought: go.\nAction: load_dataset_summary\n'
+            'Action Input: {"dataset_name": "iris"}')
+    a, llm = agent([same] * 4 + [" Iris holds 150 samples over 3 classes."],
+                   max_iterations=8)
+    record = a.run("Describe iris.")
+
+    assert record.final_answer == "Iris holds 150 samples over 3 classes."
+    assert len(llm.prompts) == 5   # four loop turns plus one forced call, no retry
+
+
+def test_forced_final_strips_trailing_protocol_text():
+    """The model often bolts another Action onto its forced answer; it must be cut."""
+    same = ('Thought: go.\nAction: load_dataset_summary\n'
+            'Action Input: {"dataset_name": "iris"}')
+    a, _ = agent([same] * 4 + [
+        " iris has 150 samples.\nObservation: {\"fake\": 1}\nAction: load_dataset_summary"],
+        max_iterations=8)
+    record = a.run("Describe iris.")
+    assert record.final_answer == "iris has 150 samples."
+
+
+def test_a_productive_step_resets_the_stall_counter():
+    iris = ('Thought: a.\nAction: load_dataset_summary\n'
+            'Action Input: {"dataset_name": "iris"}')
+    wine = ('Thought: b.\nAction: load_dataset_summary\n'
+            'Action Input: {"dataset_name": "wine"}')
+    a, _ = agent([iris, iris, iris, wine, iris, iris,
+                  "Thought: done.\nFinal Answer: both described."], max_iterations=10)
+    record = a.run("Describe iris and wine.")
+
+    # Two cached repeats, then real progress on wine, then two more: never three in a row.
+    assert record.forced_final is False
+    assert record.completed is True
+    assert record.final_answer == "both described."
 
 
 # --------------------------------------------------------------------------------------
@@ -291,3 +388,166 @@ def test_latency_summary_and_log_files_are_written(tmp_path):
     assert saved["completed"] is True
     assert saved["task"] == "Describe iris."
     assert "FINAL ANSWER" in paths["log"].read_text(encoding="utf-8")
+
+
+# --------------------------------------------------------------------------------------
+# Grounding audit: refusing invented results tables
+# --------------------------------------------------------------------------------------
+def test_audit_accepts_numbers_taken_from_observations():
+    obs = ['{"test_accuracy": 0.9561, "cv_mean_accuracy": 0.9543}']
+    audit = audit_grounding("Random Forest reached 0.9561 test accuracy.", obs)
+    assert audit["numbers_ungrounded"] == 0
+    assert audit["grounded_ratio"] == 1.0
+    assert is_fabricated(audit) is False
+
+
+def test_audit_allows_the_model_to_round():
+    """0.96 is a legitimate rendering of an observed 0.9561, not an invention."""
+    obs = ['{"test_accuracy": 0.9561}']
+    audit = audit_grounding("It scored about 0.96 accuracy.", obs)
+    assert audit["numbers_ungrounded"] == 0
+
+
+def test_audit_flags_an_entirely_invented_results_table():
+    obs = ['{"status": "ok", "n_samples": 178}']
+    table = (
+        "| Wine | Random Forest | 0.94 | 0.93 |\n"
+        "| Wine | Kernel SVM | 0.95 | 0.94 |\n"
+        "| Breast Cancer | Deep NN | 0.96 | 0.95 |"
+    )
+    audit = audit_grounding(table, obs)
+    assert audit["numbers_ungrounded"] == audit["numbers_claimed"]
+    assert audit["grounded_ratio"] == 0.0
+    assert is_fabricated(audit) is True
+
+
+def test_a_single_stray_number_is_not_called_fabrication():
+    obs = ['{"a": 0.9561, "b": 0.9543, "c": 0.9474}']
+    audit = audit_grounding("Scores were 0.9561, 0.9543, 0.9474 and 0.1234.", obs)
+    assert audit["numbers_ungrounded"] == 1
+    assert is_fabricated(audit) is False
+
+
+def test_fabricated_final_answer_is_rejected_and_sent_back_to_the_loop():
+    """The real llama3.2:3b failure: a complete results table for experiments never run."""
+    invented = ("Thought: done.\nFinal Answer:\n"
+                "| Wine | RF | 0.94 | 0.93 |\n| Wine | SVM | 0.95 | 0.92 |")
+    a, llm = agent([
+        invented,
+        'Thought: I should actually run it.\nAction: train_sklearn_model\n'
+        'Action Input: {"dataset_name": "wine", "model_type": "random_forest"}',
+        "Thought: done.\nFinal Answer: Random Forest reached 0.9775 CV accuracy on wine.",
+    ], max_iterations=8)
+    record = a.run("Benchmark wine.")
+
+    assert record.grounding_rejections == 1
+    assert record.steps[0].event == "grounding_rejected"
+    assert "GROUNDING REJECTED" in llm.prompts[1]
+    # After being pushed back it runs the experiment and answers from the real number.
+    assert record.completed is True
+    assert "0.9775" in record.final_answer
+    assert record.grounding["numbers_ungrounded"] == 0
+
+
+def test_grounded_final_answer_is_accepted_immediately():
+    a, _ = agent([
+        'Thought: run it.\nAction: train_sklearn_model\n'
+        'Action Input: {"dataset_name": "wine", "model_type": "random_forest"}',
+        "Thought: done.\nFinal Answer: Wine random forest CV accuracy was 0.9775.",
+    ])
+    record = a.run("Benchmark wine.")
+    assert record.grounding_rejections == 0
+    assert record.completed is True
+    assert record.grounding["grounded_ratio"] == 1.0
+
+
+def test_rejection_budget_prevents_an_endless_grounding_argument():
+    invented = ("Thought: done.\nFinal Answer:\n"
+                "| a | 0.11 | 0.22 |\n| b | 0.33 | 0.44 |")
+    a, _ = agent([invented] * 6, max_iterations=8, max_grounding_rejections=1)
+    record = a.run("Benchmark wine.")
+    assert record.grounding_rejections == 1
+    # Once the budget is spent the answer is kept, but recorded as ungrounded.
+    assert record.completed is True
+    assert is_fabricated(record.grounding) is True
+
+
+def test_audit_accepts_a_proportion_reported_as_a_percentage():
+    """0.9742 rendered as 97.42% is faithful reporting, not fabrication."""
+    obs = ['{"test_accuracy": 0.9742, "final_loss": 0.013}']
+    audit = audit_grounding("It reached 97.42% accuracy at loss 0.013.", obs)
+    assert audit["numbers_ungrounded"] == 0
+
+
+def test_audit_still_catches_a_mangled_percentage():
+    """0.7268 explained variance reported as 92.68% is a genuine invention."""
+    audit = audit_grounding("Variance retained was 92.68%.",
+                            ['{"explained_variance_ratio": [0.7268, 0.2307]}'])
+    assert audit["ungrounded_values"] == ["92.68"]
+
+
+def test_forced_final_strips_a_restated_header_and_leading_punctuation():
+    same = ('Thought: go.\nAction: load_dataset_summary\n'
+            'Action Input: {"dataset_name": "iris"}')
+    a, _ = agent([same] * 4 + [".\n\nFinal Answer: Iris holds 150 samples."],
+                 max_iterations=8)
+    record = a.run("Describe iris.")
+    assert record.final_answer == "Iris holds 150 samples."
+
+
+def test_forced_final_prompt_enumerates_the_permitted_numbers():
+    """Listing the allowed values turns open generation into selection."""
+    same = ('Thought: go.\nAction: load_dataset_summary\n'
+            'Action Input: {"dataset_name": "iris"}')
+    a, llm = agent([same] * 4 + [" iris has 150 samples."], max_iterations=8)
+    a.run("Describe iris.")
+    assert "The ONLY numeric values you may quote are:" in llm.prompts[-1]
+
+
+def test_two_numbers_with_nothing_grounded_counts_as_fabrication():
+    """A stalled run that never trained a model still reported two model accuracies."""
+    audit = audit_grounding("Random Forest hit 97.4% and the MLP 96.8%.",
+                            ['{"n_samples": 569, "n_features": 30}'])
+    assert audit["numbers_claimed"] == 2
+    assert audit["grounded_ratio"] == 0.0
+    assert is_fabricated(audit) is True
+
+
+def test_forced_answer_that_invents_results_is_retried_then_refused():
+    """A forced answer gets no second lap of the loop, so it is verified in place."""
+    same = ('Thought: go.\nAction: load_dataset_summary\n'
+            'Action Input: {"dataset_name": "iris"}')
+    a, _ = agent([same] * 4 + [
+        " Random Forest hit 88.1% and the MLP 77.2%.",   # invented
+        " Random Forest hit 66.3% and the MLP 55.4%.",   # still invented on retry
+    ], max_iterations=8)
+    record = a.run("Compare two models on iris.")
+
+    assert record.grounding_rejections == 1
+    assert record.completed is False           # a fabricated answer is not a result
+    assert record.final_answer is None
+    assert "66.3" in record.rejected_answer    # kept for audit, not presented
+    assert record.steps[-1].event == "grounding_rejected"
+
+
+def test_forced_answer_recovers_on_the_retry():
+    same = ('Thought: go.\nAction: load_dataset_summary\n'
+            'Action Input: {"dataset_name": "iris"}')
+    a, _ = agent([same] * 4 + [
+        " Accuracy was 88.1% and 77.2%.",              # invented
+        " iris holds 150.0 samples over 3 classes.",   # grounded on retry
+    ], max_iterations=8)
+    record = a.run("Describe iris.")
+
+    assert record.grounding_rejections == 1
+    assert record.completed is True
+    assert record.final_answer == "iris holds 150.0 samples over 3 classes."
+
+
+def test_cached_note_tells_the_model_which_tools_remain_unused():
+    same = ('Thought: go.\nAction: load_dataset_summary\n'
+            'Action Input: {"dataset_name": "iris"}')
+    a, llm = agent([same, same, "Thought: done.\nFinal Answer: iris has 150.0 rows."])
+    a.run("Describe iris.")
+    assert "Tools you have NOT yet used" in llm.prompts[2]
+    assert "train_sklearn_model" in llm.prompts[2]

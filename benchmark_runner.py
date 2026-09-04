@@ -31,7 +31,22 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
-from ml_tools import call_tool
+import numpy as np
+from scipy import stats as scipy_stats
+from sklearn.base import clone
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import RandomizedSearchCV, StratifiedKFold
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
+
+from ml_tools import (
+    DATASETS as ML_DATASETS,
+    PARAM_GRIDS,
+    RANDOM_STATE,
+    TorchMLPClassifier,
+    call_tool,
+)
 
 ROOT = Path(__file__).resolve().parent
 DOCS_DIR = ROOT / "docs"
@@ -213,9 +228,158 @@ def render_markdown(results: Dict[str, List[Dict[str, Any]]]) -> str:
 
 
 # --------------------------------------------------------------------------------------
+# Paired cross-validation and significance testing
+# --------------------------------------------------------------------------------------
+# The summary table above reports each algorithm under whatever protocol its tool uses.
+# That is what the agent sees, but it is not a rigorous comparison: the numbers come from
+# different splits, so a difference between two of them mixes real effect with split noise.
+#
+# This section fixes that. All three algorithms are scored on the SAME outer folds, and the
+# differences are tested with the Nadeau-Bengio corrected resampled t-test -- the test
+# Raschka recommends for exactly this situation, because the ordinary paired t-test assumes
+# independent folds and cross-validation folds share training data, which makes the naive
+# test far too eager to declare significance.
+OUTER_FOLDS = 10
+INNER_FOLDS = 3
+SVM_SEARCH_ITER = 15
+
+
+def _paired_estimators():
+    """Three comparable estimators. Tuning happens INSIDE each outer training fold.
+
+    Selecting SVM hyperparameters once on the whole dataset and then reporting
+    cross-validated accuracy for the winner would leak the test folds into model
+    selection and inflate the score. Nesting the search keeps the comparison honest.
+    """
+    return {
+        "Random Forest": RandomForestClassifier(
+            n_estimators=50, random_state=RANDOM_STATE
+        ),
+        "Kernel SVM (tuned)": RandomizedSearchCV(
+            Pipeline([("scaler", StandardScaler()), ("clf", SVC(random_state=RANDOM_STATE))]),
+            PARAM_GRIDS["svc"],
+            n_iter=SVM_SEARCH_ITER,
+            cv=StratifiedKFold(INNER_FOLDS, shuffle=True, random_state=RANDOM_STATE),
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+        ),
+        "Deep MLP (Dropout+BN)": Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", TorchMLPClassifier(hidden_dims=(64, 32), dropout=0.3, batch_norm=True,
+                                       epochs=100, lr=0.01, scheduler="cosine")),
+        ]),
+    }
+
+
+def paired_cv_scores(dataset: str, folds: int = OUTER_FOLDS) -> Dict[str, List[float]]:
+    """Score every algorithm on identical stratified folds."""
+    data = ML_DATASETS[dataset]()
+    X, y = data.data, data.target
+    splitter = StratifiedKFold(folds, shuffle=True, random_state=RANDOM_STATE)
+    splits = list(splitter.split(X, y))
+
+    scores: Dict[str, List[float]] = {}
+    for label, estimator in _paired_estimators().items():
+        fold_scores = []
+        for train_idx, test_idx in splits:
+            est = clone(estimator)
+            est.fit(X[train_idx], y[train_idx])
+            fold_scores.append(float(est.score(X[test_idx], y[test_idx])))
+        scores[label] = fold_scores
+        print(f"  {dataset:<14} {label:<22} "
+              f"{statistics.mean(fold_scores):.4f} +/- {statistics.pstdev(fold_scores):.4f}",
+              flush=True)
+    return scores
+
+
+def corrected_resampled_ttest(a: List[float], b: List[float], folds: int) -> Dict[str, float]:
+    """Nadeau & Bengio corrected resampled t-test for k-fold cross-validation.
+
+        t = mean(d) / sqrt( (1/k + n_test/n_train) * var(d) )
+
+    In k-fold CV the ratio n_test/n_train is exactly 1/(k-1). The correction term is what
+    accounts for the training-set overlap between folds; without it the variance is
+    underestimated and almost any difference looks significant.
+    """
+    d = np.asarray(a, dtype=float) - np.asarray(b, dtype=float)
+    k = len(d)
+    mean_d = float(d.mean())
+    var_d = float(d.var(ddof=1))
+
+    if var_d == 0.0:
+        # Zero variance in the differences. Two very different cases hide here:
+        #   mean 0  -> the models scored identically on every fold: no difference at all.
+        #   mean !=0 -> one model beat the other by the SAME margin on every single fold,
+        #              which is a perfectly consistent effect, not an absent one. Returning
+        #              "not significant" here would invert the finding.
+        if mean_d == 0.0:
+            return {"mean_difference": 0.0, "t_statistic": 0.0,
+                    "p_value": 1.0, "significant": False, "degenerate": "identical scores"}
+        return {"mean_difference": round(mean_d, 4), "t_statistic": float("inf"),
+                "p_value": 0.0, "significant": True,
+                "degenerate": "constant difference across all folds"}
+
+    correction = (1.0 / k) + (1.0 / (k - 1))
+    t_stat = mean_d / (correction * var_d) ** 0.5
+    p_value = float(2.0 * scipy_stats.t.sf(abs(t_stat), df=k - 1))
+    return {
+        "mean_difference": round(mean_d, 4),
+        "t_statistic": round(float(t_stat), 3),
+        "p_value": round(p_value, 4),
+        "significant": bool(p_value < 0.05),
+    }
+
+
+def render_significance_markdown(all_scores: Dict[str, Dict[str, List[float]]]) -> str:
+    lines = [
+        "## Paired cross-validation and significance tests",
+        "",
+        f"Every algorithm scored on the **same** {OUTER_FOLDS} stratified folds "
+        f"(`random_state={RANDOM_STATE}`). SVM hyperparameters are searched inside each "
+        f"outer training fold ({SVM_SEARCH_ITER} candidates, {INNER_FOLDS}-fold inner CV), "
+        "so model selection never sees the fold it is scored on.",
+        "",
+        "Differences are tested with the **Nadeau-Bengio corrected resampled t-test**, "
+        "which inflates the variance estimate to account for the training-set overlap "
+        "between folds. An uncorrected paired t-test on CV folds systematically "
+        "overstates significance.",
+        "",
+    ]
+
+    for dataset, scores in all_scores.items():
+        lines += [f"### {dataset}", "",
+                  "| Algorithm | Mean accuracy | Std | Per-fold range |",
+                  "|---|---|---|---|"]
+        for label, fold_scores in scores.items():
+            lines.append(
+                f"| {label} | {statistics.mean(fold_scores):.4f} "
+                f"| {statistics.pstdev(fold_scores):.4f} "
+                f"| {min(fold_scores):.4f} – {max(fold_scores):.4f} |"
+            )
+
+        lines += ["", "| Comparison | Mean diff | t | p | Verdict (α=0.05) |",
+                  "|---|---|---|---|---|"]
+        labels = list(scores)
+        for i in range(len(labels)):
+            for j in range(i + 1, len(labels)):
+                a, b = labels[i], labels[j]
+                r = corrected_resampled_ttest(scores[a], scores[b], OUTER_FOLDS)
+                verdict = ("**significant**" if r["significant"]
+                           else "not significant")
+                lines.append(
+                    f"| {a} vs {b} | {r['mean_difference']:+.4f} | {r['t_statistic']} "
+                    f"| {r['p_value']} | {verdict} |"
+                )
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------------------
 # Agent-driven benchmark
 # --------------------------------------------------------------------------------------
-def run_agent_benchmark(model: str, max_iterations: int, quiet: bool) -> int:
+def run_agent_benchmark(model: str, max_iterations: int, quiet: bool,
+                        max_unproductive: int = 6) -> int:
     from react_agent import OllamaClient, ReActAgent, save_run
 
     client = OllamaClient(model=model)
@@ -225,8 +389,10 @@ def run_agent_benchmark(model: str, max_iterations: int, quiet: bool) -> int:
               "Inside WSL run: ollama serve &", file=sys.stderr)
         return 1
 
+    # This task needs six separate experiments, so the model deserves more slack before
+    # the stall-breaker fires than a single-question scenario does.
     agent = ReActAgent(llm=client, model=model, max_iterations=max_iterations,
-                       verbose=not quiet)
+                       max_unproductive_steps=max_unproductive, verbose=not quiet)
     record = agent.run(BENCHMARK_TASK)
     paths = save_run(record, label="benchmark")
 
@@ -329,12 +495,15 @@ def main(argv: List[str] | None = None) -> int:
     parser.add_argument("--model", default="llama3.2:3b")
     parser.add_argument("--max-iterations", type=int, default=18)
     parser.add_argument("--repeats", type=int, default=3, help="latency mode repeats")
+    parser.add_argument("--max-unproductive", type=int, default=6,
+                        help="stalled steps tolerated before finalisation is forced")
     parser.add_argument("--out", default=str(DOCS_DIR / "BENCHMARK.md"))
     parser.add_argument("-q", "--quiet", action="store_true")
     args = parser.parse_args(argv)
 
     if args.mode == "agent":
-        return run_agent_benchmark(args.model, args.max_iterations, args.quiet)
+        return run_agent_benchmark(args.model, args.max_iterations, args.quiet,
+                                   args.max_unproductive)
     if args.mode == "latency":
         return run_latency_benchmark(args.model, args.repeats)
 
@@ -343,10 +512,19 @@ def main(argv: List[str] | None = None) -> int:
     results = run_direct_benchmark(verbose=not args.quiet)
     markdown = render_markdown(results)
 
+    print(f"\nRunning paired {OUTER_FOLDS}-fold comparison with nested SVM tuning...")
+    paired: Dict[str, List[float]] = {}
+    all_scores = {}
+    for dataset in DATASETS:
+        all_scores[dataset] = paired_cv_scores(dataset)
+    markdown += "\n" + render_significance_markdown(all_scores)
+    paired = all_scores
+
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(markdown, encoding="utf-8")
 
+    results = {"tool_protocol": results, "paired_cv_folds": paired}
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     json_path = LOG_DIR / f"benchmark_direct_{datetime.now():%Y%m%d_%H%M%S}.json"
     json_path.write_text(json.dumps(results, indent=2), encoding="utf-8")

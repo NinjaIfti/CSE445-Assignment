@@ -48,7 +48,10 @@ def test_load_dataset_summary_all_datasets(dataset):
     assert out["dataset"] == dataset
     assert out["n_samples"] > 0 and out["n_features"] > 0
     assert out["missing_values"] == 0
-    assert sum(out["class_balance"].values()) == out["n_samples"]
+    assert sum(out["samples_per_class"].values()) == out["n_samples"]
+    # Proportions must be a genuine distribution, so the agent cannot confuse the two.
+    # Each value is rounded to 4dp, so the sum can drift by up to n_classes * 5e-5.
+    assert abs(sum(out["class_proportions"].values()) - 1.0) < 1e-3
 
 
 @pytest.mark.parametrize("model", ["decision_tree", "logistic_regression", "random_forest"])

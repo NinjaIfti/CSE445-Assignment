@@ -34,6 +34,7 @@ from typing import Any, Callable, Dict, List
 import numpy as np
 import pandas as pd
 
+from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.datasets import load_breast_cancer, load_iris, load_wine
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
@@ -184,7 +185,11 @@ def load_dataset_summary(dataset_name: str) -> str:
             "feature_names": list(data.feature_names)[:10],
             "n_classes": int(len(classes)),
             "class_names": [str(c) for c in getattr(data, "target_names", classes)],
-            "class_balance": {str(c): int(n) for c, n in zip(classes, counts)},
+            # Named "samples_per_class" rather than "class_balance" on purpose: given the
+            # latter, llama3.2:3b reported the raw counts {59, 71, 48} as percentages.
+            "samples_per_class": {str(c): int(n) for c, n in zip(classes, counts)},
+            "class_proportions": {str(c): round(float(n) / len(data.target), 4)
+                                  for c, n in zip(classes, counts)},
             "missing_values": int(df.isnull().sum().sum()),
             "feature_scale_range": {
                 "min_of_means": round(float(df[data.feature_names].mean().min()), 4),
@@ -857,6 +862,101 @@ def train_deep_classifier(
             "train_seconds": round(train_seconds, 4),
         }
     )
+
+
+# ======================================================================================
+# Scikit-Learn compatible wrapper for the PyTorch network
+# ======================================================================================
+class TorchMLPClassifier(BaseEstimator, ClassifierMixin):
+    """Expose `DeepClassifier` through the Scikit-Learn estimator API.
+
+    Comparing a neural network against classical estimators is only meaningful if both
+    are scored on *identical* cross-validation folds. Wrapping the network here lets it
+    be dropped straight into `cross_val_score`, `Pipeline` and the paired significance
+    tests in benchmark_runner.py, instead of being evaluated by a separate protocol whose
+    numbers are not strictly comparable.
+
+    Following the Scikit-Learn contract, __init__ only stores its arguments -- all
+    validation and state creation happens in fit(), so that clone() works correctly.
+    """
+
+    def __init__(self, hidden_dims=(64, 32), dropout=0.3, batch_norm=True, epochs=100,
+                 lr=0.01, batch_size=32, scheduler="cosine", weight_decay=0.0,
+                 seed=RANDOM_STATE):
+        self.hidden_dims = hidden_dims
+        self.dropout = dropout
+        self.batch_norm = batch_norm
+        self.epochs = epochs
+        self.lr = lr
+        self.batch_size = batch_size
+        self.scheduler = scheduler
+        self.weight_decay = weight_decay
+        self.seed = seed
+
+    def fit(self, X, y):
+        _seed_everything(int(self.seed))
+        X = np.asarray(X, dtype=np.float32)
+        y = np.asarray(y)
+        self.classes_ = np.unique(y)
+        y_idx = np.searchsorted(self.classes_, y)
+
+        X_t = torch.tensor(X, dtype=torch.float32)
+        y_t = torch.tensor(y_idx, dtype=torch.long)
+        n_train = X_t.shape[0]
+        batch_size = int(max(2, min(int(self.batch_size), n_train)))
+
+        self.model_ = DeepClassifier(
+            X_t.shape[1], list(self.hidden_dims), len(self.classes_),
+            float(self.dropout), bool(self.batch_norm),
+        )
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam(self.model_.parameters(), lr=float(self.lr),
+                               weight_decay=float(self.weight_decay))
+
+        epochs = int(self.epochs)
+        if self.scheduler == "cosine":
+            sched = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs))
+        elif self.scheduler == "step":
+            sched = optim.lr_scheduler.StepLR(optimizer, step_size=max(1, epochs // 3),
+                                              gamma=0.1)
+        elif self.scheduler == "plateau":
+            sched = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
+        else:
+            sched = None
+
+        for _ in range(epochs):
+            self.model_.train()
+            perm = torch.randperm(n_train)
+            epoch_loss, n_batches = 0.0, 0
+            for i in range(0, n_train, batch_size):
+                idx = perm[i : i + batch_size]
+                if len(idx) < 2 and self.batch_norm:
+                    continue
+                optimizer.zero_grad()
+                loss = criterion(self.model_(X_t[idx]), y_t[idx])
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(
+                        f"Training diverged (loss={loss.item()}) at lr={self.lr}."
+                    )
+                loss.backward()
+                optimizer.step()
+                epoch_loss += float(loss.item())
+                n_batches += 1
+            if sched is not None:
+                if self.scheduler == "plateau":
+                    sched.step(epoch_loss / max(1, n_batches))
+                else:
+                    sched.step()
+
+        self.n_features_in_ = X_t.shape[1]
+        return self
+
+    def predict(self, X):
+        self.model_.eval()
+        with torch.no_grad():
+            logits = self.model_(torch.tensor(np.asarray(X, dtype=np.float32)))
+            idx = torch.argmax(logits, dim=1).numpy()
+        return self.classes_[idx]
 
 
 # ======================================================================================

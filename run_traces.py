@@ -119,6 +119,10 @@ def main(argv: List[str] | None = None) -> int:
             "repairs": record.repairs,
             "parse_errors": record.parse_errors,
             "seconds": record.total_seconds,
+            "forced_final": record.forced_final,
+            "grounding": record.grounding,
+            "grounding_rejections": record.grounding_rejections,
+            "rejected_answer": record.rejected_answer,
             "latency": record.latency_summary(),
             "log": paths["log"].name,
             "json": paths["json"].name,
@@ -141,14 +145,17 @@ def _write_index(index: List[Dict[str, object]], model: str) -> None:
         f"Model `{model}` served by Ollama inside WSL2. "
         f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} by `run_traces.py`.",
         "",
-        "| Scenario | Steps | Tool calls | Self-corrections | Parse recoveries | "
+        "| Scenario | Steps | Tool calls | Self-corrections | Grounding | "
         "Completed | Wall (s) | Log |",
         "|---|---|---|---|---|---|---|---|",
     ]
     for e in index:
+        g = e["grounding"] or {}
+        ground = (f"{g.get('numbers_claimed', 0) - g.get('numbers_ungrounded', 0)}"
+                  f"/{g.get('numbers_claimed', 0)} numbers verified")
         lines.append(
             f"| {e['scenario']} | {e['steps']} | {e['tool_calls']} | {e['repairs']} "
-            f"| {e['parse_errors']} | {'yes' if e['completed'] else 'no'} "
+            f"| {ground} | {'yes' if e['completed'] else 'REJECTED'} "
             f"| {e['seconds']} | [`{e['log']}`]({e['log']}) |"
         )
 
@@ -168,6 +175,13 @@ def _write_index(index: List[Dict[str, object]], model: str) -> None:
         ]
         if e["final_answer"]:
             lines += ["**Final Answer:**", "", "```", str(e["final_answer"]).strip(), "```", ""]
+        elif e["rejected_answer"]:
+            lines += [
+                "**Final Answer: REJECTED.** The agent produced an answer whose numbers "
+                "appear in no Observation from this run, so it was refused rather than "
+                "reported. The rejected text is kept below for audit:",
+                "", "```", str(e["rejected_answer"]).strip(), "```", "",
+            ]
         else:
             lines += ["**Final Answer:** _not reached within the iteration budget._", ""]
 
