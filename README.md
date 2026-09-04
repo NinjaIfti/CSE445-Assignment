@@ -20,7 +20,7 @@ the report proper** (§1–§11).
 
 **Part I — Using it:** [Quickstart](#quickstart) · [Usage](#usage) · [Tool catalogue](#tool-catalogue) · [Testing](#testing) · [Repository map](#repository-map) · [Troubleshooting](#troubleshooting)
 
-**Part II — Technical report:** [1 Objectives](#1-objectives-and-scope) · [2 Architecture](#2-system-architecture) · [3 Local LLM in WSL2](#3-local-llm-architecture-in-wsl2) · [4 Prompt engineering](#4-prompt-engineering) · [5 Parsing](#5-parsing-designing-for-a-model-that-will-not-comply) · [6 ML tools](#6-machine-learning-tool-implementation) · [7 Results & statistics](#7-experimental-results-and-statistical-analysis) · [8 Latency](#8-inference-latency-in-wsl2) · [9 Reliability](#9-reliability-self-correction-stall-breaking-and-grounding) · [10 Verification](#10-verification) · [11 Limitations](#11-limitations-and-future-work)
+**Part II — Technical report:** [Summary of findings](#summary-of-findings) · [1 Objectives](#1-objectives-and-scope) · [2 Architecture](#2-system-architecture) · [3 Local LLM in WSL2](#3-local-llm-architecture-in-wsl2) · [4 Prompt engineering](#4-prompt-engineering) · [5 Parsing](#5-parsing-designing-for-a-model-that-will-not-comply) · [6 ML tools](#6-machine-learning-tool-implementation) · [7 Results & statistics](#7-experimental-results-and-statistical-analysis) · [8 Latency](#8-inference-latency-in-wsl2) · [9 Reliability](#9-reliability-self-correction-stall-breaking-and-grounding) · [10 Verification](#10-verification) · [11 Limitations](#11-limitations-and-future-work)
 
 ---
 
@@ -85,7 +85,8 @@ python react_agent.py --health
 ```bash
 python react_agent.py "Which model generalises best on wine, and by how much?"
 
-python run_traces.py                            # 4 execution traces -> logs/TRACES.md
+python run_traces.py --tag llama32-3b           # 6 traces -> logs/TRACES_llama32-3b.md
+python run_traces.py --model mistral:7b --tag mistral7b   # same six on a 7B model
 python benchmark_runner.py --mode direct        # reference benchmark -> docs/BENCHMARK.md
 python benchmark_runner.py --mode agent         # agent runs it -> docs/BENCHMARK_AGENT.md
 python benchmark_runner.py --mode latency -r 5  # WSL2 inference -> docs/LATENCY.md
@@ -107,7 +108,7 @@ generated from it, so the catalogue the model sees can never drift from the code
 | 3 | `train_pytorch_mlp` | 1 | One-hidden-layer MLP, full-batch Adam |
 | 4 | `tune_hyperparameters` | 2 | GridSearchCV / RandomizedSearchCV over kernel SVM and decision trees |
 | 5 | `feature_selection` | 2 | PCA and Sequential Feature Selection vs a full-feature baseline |
-| 6 | `train_deep_classifier` | 2 | Deep MLP with Dropout, BatchNorm, cosine/step/plateau LR schedulers |
+| 6 | `train_deep_classifier` | 2 | Deep MLP with Dropout, BatchNorm, cosine/step/plateau LR schedulers, Adam or SGD |
 
 Datasets: `iris`, `wine`, `breast_cancer`. Every tool returns a JSON **string** —
 `{"status": "ok", ...}` or `{"status": "error", "error_type": ..., "hint": ...,
@@ -115,7 +116,7 @@ Datasets: `iris`, `wine`, `breast_cancer`. Every tool returns a JSON **string** 
 
 ## Testing
 
-**86 offline tests.** They need no Ollama and no network: a `ScriptedLLM` replays fixed
+**109 offline tests.** They need no Ollama and no network: a `ScriptedLLM` replays fixed
 model turns, so the parser, dispatcher, self-correction engine, stall-breaker and
 grounding audit are all verified deterministically.
 
@@ -123,13 +124,13 @@ grounding audit are all verified deterministically.
 python -m pytest tests -q
 ```
 ```
-86 passed
+109 passed
 ```
 
 | File | Tests | Covers |
 |---|---|---|
-| `tests/test_ml_tools.py` | 31 | All six tools, all three datasets, every scheduler, determinism, every error path |
-| `tests/test_react_agent.py` | 46 | Parsing, multi-tool chaining, self-correction, stall-breaking, grounding audit, logging |
+| `tests/test_ml_tools.py` | 48 | All six tools, all three datasets, every scheduler, determinism, every error path |
+| `tests/test_react_agent.py` | 52 | Parsing, multi-tool chaining, self-correction, stall-breaking, grounding audit, logging |
 | `tests/test_statistics.py` | 9 | Corrected resampled t-test, paired CV, significance rendering |
 
 ## Repository map
@@ -138,17 +139,18 @@ python -m pytest tests -q
 ├── ml_tools.py           # 6 ML tools + registry + validating dispatcher + sklearn wrapper
 ├── react_agent.py        # ReAct controller, Ollama client, self-correction, grounding audit
 ├── benchmark_runner.py   # direct / agent / latency modes + paired CV significance tests
-├── run_traces.py         # generates the 4 required execution traces
+├── run_traces.py         # generates the 6 execution traces
 ├── requirements.txt
 ├── setup_windows.ps1     # WSL2 install (Administrator, once)
 ├── setup_wsl.sh          # full in-WSL bootstrap (idempotent)
-├── tests/                # 86 offline tests
+├── tests/                # 109 offline tests
 ├── docs/
 │   ├── BENCHMARK.md      # generated: tool protocol + paired CV significance
 │   ├── BENCHMARK_AGENT.md# generated: the agent's own benchmark table
 │   └── LATENCY.md        # generated: WSL2 inference latency
 └── logs/
-    ├── TRACES.md         # generated: index of all four traces
+    ├── TRACES_llama32-3b.md   # generated: six traces on the 3B model
+    ├── TRACES_mistral7b.md    # generated: the same six on the 7B model
     └── *.log / *.json    # generated: per-run transcripts and structured records
 ```
 
@@ -166,6 +168,36 @@ python -m pytest tests -q
 ---
 
 # Part II — Technical Report
+
+## Summary of findings
+
+For a reader who wants the substance before the detail:
+
+1. **A 3B model is not a reliable function caller.** Nearly every mechanism in §9 exists
+   because `llama3.2:3b` failed in that specific way during a real run — stalling on a tool
+   it had already called, emitting an empty answer, reading counts as percentages, and in
+   one case inventing a complete results table. None of this was predictable from the
+   offline test suite.
+2. **The most dangerous failure produced no error at all** (§9.3). Asked to benchmark six
+   model/dataset combinations, the agent ran one, then wrote a confident, well-formatted
+   six-row table in which every figure was fabricated — including a clinical-screening
+   recommendation. A grounding audit that checks each reported number against the actual
+   observations now refuses such answers outright.
+3. **Optimism bias is measurable and large** (§7.2). The tuned SVM's headline 0.9931 on
+   wine falls to 0.9833 under nested cross-validation, and the random forest overtakes it.
+   The 0.0098 gap is the cost of having selected hyperparameters on the evaluation folds.
+4. **None of the algorithm differences is statistically significant** (§7.3). Under the
+   Nadeau–Bengio corrected resampled t-test, all six pairwise comparisons across both
+   datasets return p > 0.05. Reporting a winner from the fourth decimal place would be
+   unsupportable.
+5. **Model scale, not design, is the binding constraint** (§9.6). The identical prompt,
+   tools and controller against `mistral:7b` completes 6 of 6 experiments with 17 of 17
+   numbers grounded. The scaffolding lets a 3B model fail *safely*; it cannot make it
+   capable.
+6. **Nine defects in this project produced plausible output and were silently wrong**
+   (§10) — a significance test that inverted its own verdict, a grounding audit that let
+   fabrications validate themselves, and a `bool("false")` that quietly ran a different
+   neural architecture than the one requested. None raised an exception.
 
 ## 1. Objectives and scope
 
@@ -394,6 +426,55 @@ as documentation, and an ambiguous name is a prompting bug.
 The brace scanner is deliberately string-aware: a naïve `text[find("{"):rfind("}")+1]`
 breaks on any argument value containing a brace. Each row is covered by a test.
 
+### 5.1 Two parsing bugs that produced no error
+
+Both were found by reading a real trace, not by the test suite, and both share a shape:
+the call **succeeded** against arguments the model had not asked for.
+
+The `nan_recovery` scenario asks for `hidden_dims=[64, 32]` and `batch_norm=false`. The
+trace showed the tool receiving `hidden_dims: "[64"`. The `key=value` fallback matched
+values with `[^,\n]+`, which stops at the first comma — including the comma *inside* the
+list. The value scanner now tracks bracket depth and string state.
+
+Worse, the same call recorded `batch_norm: true` despite the model asking for `false`.
+Function-call syntax delivers the bare word `false` as the **string** `"false"`, and
+`bool("false")` is `True`. The requested architecture was silently inverted, which is
+precisely why training never diverged and the scenario never exercised the path it exists
+to demonstrate. Booleans now go through `_coerce_bool`, which accepts the usual textual
+forms and rejects anything else rather than guessing.
+
+Neither bug raised an exception, failed a test, or appeared anywhere in the output. The
+only symptom was a scenario that quietly did the wrong experiment.
+
+### 5.2 When prose looks like protocol
+
+A third trace bug is the sharpest of the set. The model produced a perfectly well-formed
+turn:
+
+```
+Thought: ... I will retry the same Action with a learning rate ten times smaller.
+
+Action: train_deep_classifier
+Action Input: {"dataset_name": "breast_cancer", ...}
+```
+
+and the controller dispatched a tool called **`with`**. The header pattern was
+`Action\s*:?\s*(\w+)` — with the colon *optional*, the phrase "the same Action with" inside
+the Thought matched first, because `re.search` scans left to right and the prose comes
+before the header.
+
+The fix is to require the colon and anchor the header to the start of a line, which is what
+actually distinguishes a protocol header from a sentence that happens to contain the word.
+The same applied to `Action Input`. The hallucination firewall caught the consequence —
+`unknown_tool` rather than a crash — but the agent still lost a step to a bug in the
+component whose entire job is reading the model correctly.
+
+The same trace showed a second problem: the generation was cut off mid-object at
+`"lr": 0.` by the 512-token `num_predict` cap. That is a truncated generation, not
+malformed JSON, and the parser now says so — telling the model to re-issue a shorter call
+is actionable, while "invalid JSON" sends it hunting for a syntax error that is not there.
+The cap is now 1024.
+
 The function-call fallback earned its place immediately — in every real trace,
 `llama3.2:3b` preferred `Action: load_dataset_summary(dataset_name="wine")` over the
 documented two-line form, despite the prompt showing only the latter. Across the four
@@ -439,14 +520,30 @@ eigenvectors of the covariance matrix; SFS greedily optimises cross-validated ac
 directly. They answer different questions and both are reported.
 
 **`train_deep_classifier`** — a configurable `[Linear → BatchNorm → ReLU → Dropout] × N →
-Linear` stack with cosine, step, plateau or no LR schedule, plus optional weight decay.
-Cosine annealing follows
+Linear` stack with cosine, step, plateau or no LR schedule, optional weight decay, and a
+choice of Adam or SGD. Cosine annealing follows
 
 $$\eta_t = \eta_{\min} + \tfrac{1}{2}(\eta_{\max}-\eta_{\min})\left(1+\cos\left(\tfrac{t}{T}\pi\right)\right)$$
 
 It reports `generalisation_gap` = train − test accuracy, the quantity Dropout and BatchNorm
 exist to control. Reporting it makes over-fitting visible to the agent rather than leaving
 it to be inferred.
+
+**Why the optimizer choice exists.** Task 3 requires the agent to recover from a NaN loss,
+which means divergence has to be genuinely reachable. It is not with Adam: Adam rescales
+each gradient by its running second moment, and even at `lr=9.9` — the top of the accepted
+range — it converges. Plain SGD has no such protection and, without BatchNorm, diverges
+reliably at that step size. Adding the optimizer is therefore not decoration: it is what
+makes the `nan_loss` path testable end-to-end rather than only under a monkeypatch, and
+optimiser comparison is textbook material in its own right.
+
+The recovery hint needed care too. "Retry with a 10× smaller learning rate" sounds
+reasonable and is **wrong here**: from `lr=9.9` it lands on 0.99, which limps to 0.63
+accuracy, while 0.5 diverges again and 0.1 trains cleanly to 0.9561. Recovery is not
+monotonic in the learning rate. The suggestion is therefore clamped to a value known to be
+stable for the optimiser in use (0.1 for SGD, 0.01 for Adam), and a test asserts that
+following the hint *actually converges* — a hint that does not fix the problem is worse
+than no hint, because the agent will faithfully follow it into a second failure.
 
 ### 6.3 Reproducibility
 
@@ -668,14 +765,35 @@ stop doing what it just did.
 
 ### 9.4 Observed behaviour
 
-All four scenarios in `logs/TRACES.md` reach a Final Answer, and every answer passes the
-grounding audit (3/3, 2/2, 2/3 and 3/3 numbers verified). Detailed transcripts are in
-`logs/`, each carrying per-step latency, token counts and its grounding result.
+Six scenarios were run against both models — twelve traces in total. **All twelve reach a
+Final Answer, and all twelve pass the grounding audit with every reported number traced
+back to an observation.**
+
+| Scenario | Demonstrates | 3B steps / corrections | 7B steps / corrections |
+|---|---|---|---|
+| `single_tool` | Baseline ReAct cycle | 6 / 0 | 6 / 0 |
+| `multi_tool` | Chaining three tools | 10 / 2 | 4 / 0 |
+| `self_correction` | **Shape mismatch** recovery | 7 / 1 | 3 / 1 |
+| `nan_recovery` | **NaN loss** recovery | 8 / 1 | 3 / 1 |
+| `parameter_error` | **Parameter error** recovery | 6 / 0 | 6 / 4 |
+| `full_pipeline` | Tuning + PCA + deep net | 8 / 0 | 4 / 0 |
+
+The three failure modes Task 3 names are each demonstrated end-to-end. `nan_recovery` is
+the cleanest: both models request `lr=9.9`, receive `nan_loss`, read the clamped
+suggestion, retry at `lr=0.1`, and reach 0.9474 test accuracy.
+
+The difference between the models is not success versus failure — it is *directness*. The
+3B model needs 45 steps across the six scenarios where the 7B needs 26, and it wanders
+after succeeding: in `nan_recovery` it recovers at step 2, then re-calls tools it has
+already run four more times before the stall-breaker forces its conclusion. The 7B model
+recovers and stops. Both produce grounded answers; one wastes two-thirds of its budget
+doing so.
 
 The fix in §9.2 is visible in the numbers. Before the "tools you have not yet used" hint,
-the `multi_tool` scenario stalled after 4 steps having called a single tool. After it, the
-same scenario runs **9 steps and 8 tool calls**, actually training both models before
-answering.
+`multi_tool` stalled after 4 steps having called a single tool. After it, the same scenario
+runs 10 steps and 8 tool calls, actually training both models before answering.
+
+Indexes: `logs/TRACES_llama32-3b.md` and `logs/TRACES_mistral7b.md`.
 
 ### 9.5 Where the 3B model still fails
 
@@ -690,19 +808,45 @@ grounding audit in place the failure is at least *honest*: its final answer is n
 — zero numbers claimed, nothing invented. Before the audit, the same prompt produced a
 confident, fully-populated six-row results table in which **every figure was fabricated**.
 
-That is the correct engineering outcome and the wrong user outcome, which is the honest
-summary of running a 3B model as an autonomous agent: it can be made to stop lying, but it
-cannot thereby be made competent. The reference numbers in §7 therefore come from
-`--mode direct`, which executes the same matrix deterministically. §11 revisits what
-changes at 7B.
+That is the correct engineering outcome and the wrong user outcome: the model can be made
+to stop lying, but it cannot thereby be made competent.
+
+### 9.6 The same prompt at 7B
+
+The obvious question is whether this is a limit of the design or of the model. It is the
+model. Running the identical prompt, identical tools and identical controller against
+`mistral:7b` — changing only `--model` — the agent completes the task:
+
+| | `llama3.2:3b` | `mistral:7b` |
+|---|---|---|
+| Distinct experiments run | 1 of 6 | **6 of 6** |
+| Tool calls | 3, all `load_dataset_summary` | 6, correctly distributed |
+| Reached Final Answer | only when forced | **volunteered** |
+| Numbers claimed / ungrounded | 14 / 7, then 0 / 0 after refusal | **17 / 0** |
+| Produced the required table | no | **yes, with both analysis paragraphs** |
+
+Mistral called `train_sklearn_model`, `tune_hyperparameters` and `train_deep_classifier`
+across both datasets in order, then wrote the comparison table from the observations it
+had actually collected — including the correct observation that most of the differences
+are not significant given the reported standard deviations. Its output is
+`docs/BENCHMARK_AGENT.md`.
+
+Two things are worth drawing out. First, **the scaffolding is what makes the comparison
+meaningful**: without the grounding audit, the 3B run would have produced a table that
+*looked* just as complete as Mistral's, and the difference between the two models would
+have been invisible. Second, the audit passed the 7B answer untouched — it is a filter on
+fabrication, not a tax on competence.
+
+The reference numbers in §7 still come from `--mode direct`, which executes the same matrix
+deterministically and adds the nested-CV statistics no model produces on its own.
 
 ## 10. Verification
 
-**86 tests, no Ollama and no network required.**
+**109 tests, no Ollama and no network required.**
 
 ```
 $ python -m pytest tests -q
-86 passed
+109 passed
 ```
 
 A `ScriptedLLM` replays fixed model turns, so behaviours that would otherwise need a live
@@ -712,15 +856,24 @@ model on the following turn;
 `test_fabricated_final_answer_is_rejected_and_sent_back_to_the_loop` reproduces the §9.3
 failure and asserts the recovery.
 
-Several defects in this project were caught by tests or by real runs rather than by
-reading code: the latency summary silently dropped sub-millisecond calls; the corrected
-t-test returned "not significant" for two models differing by an identical margin on every
-fold, exactly inverting the finding; the grounding audit's self-validation loop above; and
-the `Observation:` stop sequence silently emptying every forced answer (§3.3).
+Defects caught by tests or by reading real traces, rather than by inspecting code:
 
-The pattern is worth naming. Every one of these is a mechanism that appears to work,
-produces plausible output, and is wrong — the class of bug that offline reasoning does not
-surface and that only shows up when the real model is driving.
+| Defect | Symptom | Why it mattered |
+|---|---|---|
+| `latency_summary` filtered on `> 0` | Sub-millisecond calls vanished from the stats | Under-reported call counts |
+| Corrected t-test's zero-variance branch | "Not significant" for two models differing by the same margin on *every* fold | Exactly inverted the verdict |
+| Grounding audit stored as an observation | Invented values became evidence next pass | A fabricated table validated itself |
+| Fabrication threshold used `< 0.5` | An answer at exactly 0.5 (7 of 14 invented) passed | Off-by-one let fiction through |
+| `Observation:` stop left on for forced answers | Empty answer every time (§3.3) | A safety default defeated a safety mechanism |
+| `[^,\n]+` value pattern | `hidden_dims=[64, 32]` became `"[64"` (§5.1) | Ran a different architecture, silently |
+| `bool("false")` | `batch_norm=false` became `True` (§5.1) | Inverted the request; the NaN scenario never diverged |
+| Optional colon in the `Action` header | Prose "the same Action with" dispatched a tool named `with` (§5.2) | Lost a step to the parser itself |
+| `num_predict: 512` | Action Input truncated mid-object | A valid call lost to the token budget |
+
+The pattern is worth naming: **every one of these produces plausible output and is wrong.**
+None raised an exception. That is the class of bug offline reasoning does not surface, and
+it is the argument for running the real model early rather than after the code "looks
+finished".
 
 **Environment:** Ubuntu 22.04.5 LTS on WSL2 (kernel 6.18.33.2-microsoft-standard-WSL2),
 Python 3.10.12, PyTorch 2.11.0+cu128 with CUDA available, NVIDIA RTX 5060 Ti (sm_120),
@@ -729,9 +882,10 @@ reproduce on re-run; latency figures are hardware-dependent.
 
 ## 11. Limitations and future work
 
-- **Model scale is the binding constraint.** `llama3.2:3b` needs every mechanism in §9 to
-  complete multi-step tasks. A 7B model follows the protocol noticeably better at roughly
-  double the latency.
+- **Model scale is the binding constraint**, and §9.6 measures it rather than asserting it:
+  on the six-experiment benchmark `llama3.2:3b` completes 1 of 6 experiments and invents
+  the rest, while `mistral:7b` completes 6 of 6 with every number grounded. The reliability
+  scaffolding is what lets a 3B model fail safely; it does not make it capable.
 - **The scratchpad grows without bound.** Each step re-sends the entire history. Beyond a
   dozen steps this dominates latency; summarising older observations, or using Ollama's
   `context` token array, would bound it.
@@ -752,10 +906,24 @@ reproduce on re-run; latency figures are hardware-dependent.
 | Rubric item | Marks | Where |
 |---|---|---|
 | WSL & local LLM setup | 15 | `setup_windows.ps1`, `setup_wsl.sh`, `react_agent.py --health`, [§3](#3-local-llm-architecture-in-wsl2) |
-| ReAct loop & action parsing | 25 | `react_agent.py`, `tests/test_react_agent.py`, [§5](#5-parsing-designing-for-a-model-that-will-not-comply), `logs/TRACES.md` |
+| ReAct loop & action parsing | 25 | `react_agent.py`, `tests/test_react_agent.py`, [§5](#5-parsing-designing-for-a-model-that-will-not-comply), `logs/TRACES_*.md` |
 | PyTorch & Scikit-Learn tools | 30 | `ml_tools.py`, `tests/test_ml_tools.py`, [§6](#6-machine-learning-tool-implementation) |
 | Statistical analysis & reasoning | 20 | `benchmark_runner.py`, `docs/BENCHMARK.md`, [§7](#7-experimental-results-and-statistical-analysis) |
-| Report & engineering quality | 10 | This document, the 86-test suite |
+| Report & engineering quality | 10 | This document, the 109-test suite |
+
+### Task coverage against the brief
+
+| Task | Requirement | Where |
+|---|---|---|
+| 1 (25) | WSL2 + Ollama + venv with full GPU/CPU PyTorch support | `setup_windows.ps1`, `setup_wsl.sh` (auto-selects `cu128`), §3.1 |
+| 1 | Baseline ReAct loop, single-tool and multi-tool traces verified | `single_tool` and `multi_tool` in `logs/TRACES_*.md` |
+| 2 (40) | Hyperparameter tuning: GridSearchCV / RandomizedSearchCV for SVC and Decision Trees | `tune_hyperparameters`, §6.2 |
+| 2 | Feature selection & dimensionality reduction: PCA + sequential feature selection | `feature_selection`, §6.2 |
+| 2 | Deep PyTorch classifier with Dropout, BatchNorm, custom LR schedulers | `train_deep_classifier`, §6.2 |
+| 3 (35) | Self-healing on **shape mismatch** | `self_correction` trace |
+| 3 | Self-healing on **parameter error** | `parameter_error` trace |
+| 3 | Self-healing on **NaN loss** | `nan_recovery` trace (SGD divergence, §6.2) |
+| 3 | Comprehensive prompt: 3 algorithms × 2 datasets, CV, Markdown summary table | `BENCHMARK_TASK` in `benchmark_runner.py` → `docs/BENCHMARK_AGENT.md`, §9.6 |
 
 | Required deliverable | Status |
 |---|---|

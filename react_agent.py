@@ -155,7 +155,9 @@ class OllamaClient:
 
     def __call__(self, prompt: str,
                  stop: Optional[List[str]] = None) -> Tuple[str, Dict[str, Any]]:
-        options: Dict[str, Any] = {"temperature": self.temperature, "num_predict": 512}
+        # 512 truncated a legitimate Action Input mid-object; the tool call was lost to
+        # the token budget rather than to any model error.
+        options: Dict[str, Any] = {"temperature": self.temperature, "num_predict": 1024}
         stop_sequences = self.DEFAULT_STOP if stop is None else stop
         if stop_sequences:
             options["stop"] = stop_sequences
@@ -207,12 +209,20 @@ class OllamaClient:
 # --------------------------------------------------------------------------------------
 # Output parsing
 # --------------------------------------------------------------------------------------
-_ACTION_RE = re.compile(r"Action\s*:?\s*\**\s*([A-Za-z0-9_]+)", re.IGNORECASE)
-_ACTION_INPUT_RE = re.compile(r"Action\s*Input\s*:?\s*\**\s*(.+)", re.IGNORECASE | re.DOTALL)
+# The colon is REQUIRED and the header must start a line. With `Action\s*:?` the word
+# "Action" occurring in ordinary prose hijacks the match: the model wrote
+# "...I will retry the same Action with a learning rate ten times smaller" above a
+# perfectly good "Action: train_deep_classifier", and the parser dispatched the tool
+# "with". Anchoring to the line start is what distinguishes a header from a sentence.
+_ACTION_RE = re.compile(r"^[ \t]*\**\s*Action\s*\**\s*:\s*\**\s*([A-Za-z0-9_]+)",
+                        re.IGNORECASE | re.MULTILINE)
+_ACTION_INPUT_RE = re.compile(r"^[ \t]*\**\s*Action\s*Input\s*\**\s*:\s*\**\s*(.+)",
+                              re.IGNORECASE | re.DOTALL | re.MULTILINE)
 _THOUGHT_RE = re.compile(r"Thought\s*:\s*(.+?)(?=\n\s*(?:Action|Final Answer)|\Z)",
                          re.IGNORECASE | re.DOTALL)
 _FINAL_RE = re.compile(r"Final\s*Answer\s*:?\s*\**\s*(.*)", re.IGNORECASE | re.DOTALL)
 _CALL_RE = re.compile(r"([A-Za-z0-9_]+)\s*\((.*)\)\s*$", re.DOTALL)
+_KV_KEY_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*")
 
 
 def _extract_first_json_object(text: str) -> Optional[str]:
@@ -254,6 +264,22 @@ def parse_action_input(raw: str) -> Tuple[Optional[Dict[str, Any]], Optional[str
     if not text:
         return None, "Action Input was empty."
 
+    # Decide by how the text starts, not by whether a brace appears anywhere. Given
+    # `opts={"k": 1}, n=5`, a brace-first search grabs the *nested* object and silently
+    # drops every other argument.
+    if not text.startswith("{") and _KV_KEY_RE.match(text):
+        kwargs = _parse_kv_pairs(text.split("\n")[0])
+        if kwargs:
+            return kwargs, None
+
+    # An Action Input cut off mid-object is a truncated generation, not malformed JSON.
+    # Saying so lets the model re-emit a shorter call instead of hunting for a syntax
+    # error that is not there.
+    if text.count("{") > text.count("}"):
+        return None, ("Action Input was cut off mid-object (the generation hit the token "
+                      f"limit): {text[-60:]!r}. Re-issue the call with fewer arguments, "
+                      "relying on the tool defaults.")
+
     candidate = _extract_first_json_object(text)
     if candidate:
         try:
@@ -270,18 +296,53 @@ def parse_action_input(raw: str) -> Tuple[Optional[Dict[str, Any]], Optional[str
                 pass
 
     # Fallback: `dataset_name="iris", epochs=50` emitted without any braces.
-    pairs = re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^,\n]+)", text.split("\n")[0])
-    if pairs:
-        kwargs: Dict[str, Any] = {}
-        for key, value in pairs:
-            value = value.strip().strip("\"'")
-            try:
-                kwargs[key] = ast.literal_eval(value)
-            except (ValueError, SyntaxError):
-                kwargs[key] = value
+    kwargs = _parse_kv_pairs(text.split("\n")[0])
+    if kwargs:
         return kwargs, None
 
     return None, f"Could not parse Action Input as JSON: {text[:160]!r}"
+
+
+def _parse_kv_pairs(text: str) -> Dict[str, Any]:
+    """Parse `a=1, b=[64, 32], c="x"` into a dict, respecting brackets and quotes.
+
+    A naive `([^,\\n]+)` value pattern splits on the comma *inside* a list, so
+    `hidden_dims=[64, 32]` silently arrives as the string "[64". That is not a parse
+    failure the agent can see -- the call succeeds against a different architecture than
+    the one requested -- so the value scan tracks bracket depth and string state instead.
+    """
+    out: Dict[str, Any] = {}
+    i, n = 0, len(text)
+    while i < n:
+        match = _KV_KEY_RE.match(text, i)
+        if not match:
+            i += 1
+            continue
+        key, start = match.group(1), match.end()
+        j, depth, quote = start, 0, None
+        while j < n:
+            ch = text[j]
+            if quote:
+                if ch == quote and text[j - 1] != "\\":
+                    quote = None
+            elif ch in "\"'":
+                quote = ch
+            elif ch in "[{(":
+                depth += 1
+            elif ch in "]})":
+                if depth == 0:
+                    break
+                depth -= 1
+            elif ch == "," and depth == 0:
+                break
+            j += 1
+        raw = text[start:j].strip()
+        try:
+            out[key] = ast.literal_eval(raw)
+        except (ValueError, SyntaxError):
+            out[key] = raw.strip("\"'")
+        i = j + 1
+    return out
 
 
 def parse_llm_output(text: str) -> Dict[str, Any]:

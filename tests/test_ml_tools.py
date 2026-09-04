@@ -235,3 +235,86 @@ def test_every_tool_returns_valid_json_for_a_garbage_dataset():
         out = parse(call_tool(name, {"dataset_name": "not_a_dataset"}))
         assert out["status"] == "error"
         assert "error_type" in out
+
+
+# --------------------------------------------------------------------------------------
+# Optimizer selection and genuine divergence (Task 3: NaN loss)
+# --------------------------------------------------------------------------------------
+@pytest.mark.parametrize("optimizer", ["adam", "sgd"])
+def test_deep_classifier_supports_both_optimizers(optimizer):
+    out = parse(call_tool("train_deep_classifier", {
+        "dataset_name": "iris", "hidden_dims": [16], "epochs": 20,
+        "optimizer": optimizer, "lr": 0.05,
+    }))
+    assert out["status"] == "ok"
+    assert out["optimisation"]["optimizer"] == optimizer
+
+
+def test_unknown_optimizer_is_rejected():
+    out = parse(call_tool("train_deep_classifier",
+                          {"dataset_name": "iris", "optimizer": "rmsprop"}))
+    assert out["error_type"] == "invalid_parameter"
+    assert out["retry_with"]["optimizer"] == "adam"
+
+
+def test_sgd_at_a_large_step_size_actually_diverges():
+    """The nan_loss path must be reachable for real, not only under monkeypatching.
+
+    Adam rescales gradients by their second moment and is very hard to blow up; plain SGD
+    without BatchNorm at lr=9.9 diverges reliably, which is what the nan_recovery trace
+    exercises end to end.
+    """
+    out = parse(call_tool("train_deep_classifier", {
+        "dataset_name": "breast_cancer", "hidden_dims": [64, 32], "epochs": 30,
+        "optimizer": "sgd", "lr": 9.9, "batch_norm": False,
+    }))
+    assert out["error_type"] == "nan_loss"
+    assert out["retry_with"]["lr"] == pytest.approx(0.1)  # clamped to a stable value
+    # The retry must preserve the rest of the configuration, or it silently becomes a
+    # different experiment from the one the user asked for.
+    assert out["retry_with"]["batch_norm"] is False
+    assert out["retry_with"]["optimizer"] == "sgd"
+    assert out["retry_with"]["hidden_dims"] == [64, 32]
+
+
+def test_the_suggested_retry_actually_converges():
+    """A hint that does not fix the problem is worse than no hint."""
+    failed = parse(call_tool("train_deep_classifier", {
+        "dataset_name": "breast_cancer", "hidden_dims": [64, 32], "epochs": 30,
+        "optimizer": "sgd", "lr": 9.9, "batch_norm": False,
+    }))
+    recovered = parse(call_tool("train_deep_classifier",
+                                {**failed["retry_with"], "epochs": 30}))
+    assert recovered["status"] == "ok"
+    assert recovered["test_accuracy"] > 0.85
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (False, False), (True, True),
+    ("false", False), ("true", True), ("False", False), ("TRUE", True),
+    ("no", False), ("yes", True), (0, False), (1, True),
+])
+def test_batch_norm_accepts_string_booleans(raw, expected):
+    """bool("false") is True. A naive cast silently inverts the caller's request."""
+    out = parse(call_tool("train_deep_classifier", {
+        "dataset_name": "iris", "hidden_dims": [16], "epochs": 10, "batch_norm": raw,
+    }))
+    assert out["status"] == "ok"
+    assert out["architecture"]["batch_norm"] is expected
+
+
+def test_nonsense_batch_norm_is_rejected_rather_than_guessed():
+    out = parse(call_tool("train_deep_classifier",
+                          {"dataset_name": "iris", "batch_norm": "maybe"}))
+    assert out["error_type"] == "invalid_parameter"
+    assert "boolean" in out["message"]
+
+
+def test_string_false_batch_norm_reaches_the_divergent_configuration():
+    """The end-to-end case: the model writes batch_norm=false in function-call syntax."""
+    out = parse(call_tool("train_deep_classifier", {
+        "dataset_name": "breast_cancer", "hidden_dims": [64, 32], "epochs": 30,
+        "optimizer": "sgd", "lr": 9.9, "batch_norm": "false",
+    }))
+    assert out["error_type"] == "nan_loss"
+    assert out["retry_with"]["batch_norm"] is False

@@ -551,3 +551,63 @@ def test_cached_note_tells_the_model_which_tools_remain_unused():
     a.run("Describe iris.")
     assert "Tools you have NOT yet used" in llm.prompts[2]
     assert "train_sklearn_model" in llm.prompts[2]
+
+
+def test_kv_fallback_keeps_a_bracketed_list_intact():
+    """A naive value pattern splits on the comma inside [64, 32] and yields "[64"."""
+    kwargs, err = parse_action_input(
+        'dataset_name="breast_cancer", hidden_dims=[64, 32], batch_norm=false, lr=9.9')
+    assert err is None
+    assert kwargs["hidden_dims"] == [64, 32]
+    assert kwargs["dataset_name"] == "breast_cancer"
+    assert kwargs["lr"] == 9.9
+
+
+def test_kv_fallback_handles_nested_structures_and_quoted_commas():
+    kwargs, err = parse_action_input(
+        'name="a, b", dims=[1, [2, 3]], opts={"k": 1, "j": 2}, n=5')
+    assert err is None
+    assert kwargs["name"] == "a, b"
+    assert kwargs["dims"] == [1, [2, 3]]
+    assert kwargs["opts"] == {"k": 1, "j": 2}
+    assert kwargs["n"] == 5
+
+
+def test_function_call_action_with_a_list_argument_survives_parsing():
+    out = parse_llm_output(
+        'Thought: train it.\n'
+        'Action: train_deep_classifier(dataset_name="breast_cancer", hidden_dims=[64, 32], '
+        'batch_norm=false, optimizer="sgd", lr=9.9)'
+    )
+    assert out["action"] == "train_deep_classifier"
+    assert out["action_input"]["hidden_dims"] == [64, 32]
+    assert out["action_input"]["batch_norm"] == "false"
+
+
+def test_the_word_action_in_prose_does_not_hijack_the_real_header():
+    """A real llama3.2:3b turn: prose mentioning "Action" preceded the actual header."""
+    out = parse_llm_output(
+        "Thought: I will retry the same Action with a learning rate ten times smaller.\n"
+        "\n"
+        "Action: train_deep_classifier\n"
+        'Action Input: {"dataset_name": "breast_cancer", "lr": 0.1}'
+    )
+    assert out["action"] == "train_deep_classifier"
+    assert out["action_input"] == {"dataset_name": "breast_cancer", "lr": 0.1}
+
+
+def test_action_input_mentioned_in_prose_does_not_hijack_the_real_one():
+    out = parse_llm_output(
+        "Thought: the Action Input above was wrong, so I will fix it.\n"
+        "Action: load_dataset_summary\n"
+        'Action Input: {"dataset_name": "wine"}'
+    )
+    assert out["action_input"] == {"dataset_name": "wine"}
+
+
+def test_truncated_action_input_is_reported_as_truncation_not_bad_json():
+    """The generation hit the token cap; telling the model that is actionable."""
+    kwargs, err = parse_action_input('{"dataset_name": "breast_cancer", "lr": 0.')
+    assert kwargs is None
+    assert "cut off mid-object" in err
+    assert "token limit" in err

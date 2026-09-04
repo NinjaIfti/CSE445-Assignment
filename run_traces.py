@@ -60,6 +60,26 @@ SCENARIOS: Dict[str, Dict[str, object]] = {
                 "using the feature_selection tool, then report how much variance is "
                 "retained and whether accuracy suffers compared with all features.",
     },
+    "nan_recovery": {
+        "title": "Recovery from divergent training (NaN loss)",
+        "demonstrates": "A deliberately unstable optimiser configuration makes the loss "
+                        "diverge to NaN. The agent reads the nan_loss error, understands "
+                        "the learning rate is too large, and retrains at a smaller one.",
+        "max_iterations": 12,
+        "task": "Call train_deep_classifier with EXACTLY these arguments and change "
+                "nothing: dataset_name=\"breast_cancer\", hidden_dims=[64, 32], "
+                "optimizer=\"sgd\", lr=9.9, batch_norm=false, epochs=100. "
+                "Then report the test accuracy you achieve.",
+    },
+    "parameter_error": {
+        "title": "Recovery from an invalid parameter",
+        "demonstrates": "The agent passes arguments the tool does not accept. The registry "
+                        "rejects them with the valid signature attached, and the agent "
+                        "re-issues the call correctly.",
+        "max_iterations": 12,
+        "task": "Train a random forest on the iris dataset using 500 estimators and a "
+                "maximum tree depth of 12, then report its cross-validated accuracy.",
+    },
     "full_pipeline": {
         "title": "Full Task 2 pipeline",
         "demonstrates": "Hyperparameter search, dimensionality reduction and a "
@@ -79,6 +99,8 @@ def main(argv: List[str] | None = None) -> int:
     parser.add_argument("--model", default="llama3.2:3b")
     parser.add_argument("--only", choices=sorted(SCENARIOS), action="append",
                         help="run only the named scenario (repeatable)")
+    parser.add_argument("--tag", default="",
+                        help="suffix for log names and the index, e.g. the model name")
     parser.add_argument("-q", "--quiet", action="store_true")
     args = parser.parse_args(argv)
 
@@ -106,7 +128,7 @@ def main(argv: List[str] | None = None) -> int:
                            max_iterations=int(scenario["max_iterations"]),
                            verbose=not args.quiet)
         record = agent.run(str(scenario["task"]))
-        paths = save_run(record, label=name)
+        paths = save_run(record, label=f"{name}_{args.tag}" if args.tag else name)
 
         index.append({
             "scenario": name,
@@ -130,14 +152,14 @@ def main(argv: List[str] | None = None) -> int:
         })
         print(f"\n-> {paths['log']}")
 
-    _write_index(index, args.model)
+    _write_index(index, args.model, args.tag)
     completed = sum(1 for e in index if e["completed"])
     print(f"\n{completed}/{len(index)} scenarios reached a Final Answer.")
-    print(f"Index written to {LOG_DIR / 'TRACES.md'}")
+    print(f"Index written to {LOG_DIR / (f'TRACES_{args.tag}.md' if args.tag else 'TRACES.md')}")
     return 0 if completed == len(index) else 2
 
 
-def _write_index(index: List[Dict[str, object]], model: str) -> None:
+def _write_index(index: List[Dict[str, object]], model: str, tag: str = "") -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     lines = [
         "# Agent Execution Traces",
@@ -185,7 +207,8 @@ def _write_index(index: List[Dict[str, object]], model: str) -> None:
         else:
             lines += ["**Final Answer:** _not reached within the iteration budget._", ""]
 
-    (LOG_DIR / "TRACES.md").write_text("\n".join(lines), encoding="utf-8")
+    name = f"TRACES_{tag}.md" if tag else "TRACES.md"
+    (LOG_DIR / name).write_text("\n".join(lines), encoding="utf-8")
 
 
 if __name__ == "__main__":

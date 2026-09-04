@@ -146,6 +146,32 @@ def _split(data, test_size: float = 0.2):
     )
 
 
+def _coerce_bool(value: Any, field: str):
+    """Return (bool, None) or (None, error_json).
+
+    JSON booleans arrive as real bools, but a small LLM using function-call syntax emits
+    the bare word `false`, which reaches us as the *string* "false". `bool("false")` is
+    True, so a naive cast silently inverts the caller's request and runs a different
+    experiment than the one asked for -- a failure with no error attached to it.
+    """
+    if isinstance(value, bool):
+        return value, None
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("true", "yes", "1"):
+            return True, None
+        if text in ("false", "no", "0"):
+            return False, None
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value), None
+    return None, _err(
+        "invalid_parameter",
+        f"{field}={value!r} is not a boolean.",
+        f"Pass {field} as true or false.",
+        {field: True},
+    )
+
+
 def _check_unit_interval(value: Any, field: str, lo: float, hi: float):
     """Validate a float hyperparameter, returning an error JSON string or None."""
     if not isinstance(value, (int, float)) or isinstance(value, bool):
@@ -690,6 +716,7 @@ def train_deep_classifier(
     batch_size: int = 32,
     scheduler: str = "cosine",
     weight_decay: float = 0.0,
+    optimizer: str = "adam",
     seed: int = RANDOM_STATE,
 ) -> str:
     """Train a regularised deep MLP with Dropout, BatchNorm and a learning-rate scheduler.
@@ -752,6 +779,19 @@ def train_deep_classifier(
             {"dataset_name": name, "scheduler": "cosine"},
         )
 
+    batch_norm, bn_err = _coerce_bool(batch_norm, "batch_norm")
+    if bn_err:
+        return bn_err
+
+    optimizer_kind = str(optimizer).lower().strip()
+    if optimizer_kind not in ("adam", "sgd"):
+        return _err(
+            "invalid_parameter",
+            f"optimizer {optimizer!r} is not recognised.",
+            "optimizer must be adam or sgd.",
+            {"dataset_name": name, "optimizer": "adam"},
+        )
+
     _seed_everything(int(seed))
     X_train, X_test, y_train, y_test = _split(data)
     scaler = StandardScaler().fit(X_train)
@@ -765,19 +805,27 @@ def train_deep_classifier(
     num_classes = int(len(np.unique(data.target)))
 
     model = DeepClassifier(
-        X_t.shape[1], hidden_dims, num_classes, float(dropout), bool(batch_norm)
+        X_t.shape[1], hidden_dims, num_classes, float(dropout), batch_norm
     )
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
+    # Adam rescales each gradient by its running second moment, so it is very hard to make
+    # it diverge; plain SGD is not protected that way and will blow up at a large step
+    # size. Offering both is what makes the nan_loss recovery path reachable in practice
+    # rather than only in a unit test.
+    if optimizer_kind == "sgd":
+        opt = optim.SGD(model.parameters(), lr=float(lr), momentum=0.9,
+                        weight_decay=float(weight_decay))
+    else:
+        opt = optim.Adam(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
 
     if sched_kind == "cosine":
-        sched = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, int(epochs)))
+        sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, int(epochs)))
     elif sched_kind == "step":
         sched = optim.lr_scheduler.StepLR(
-            optimizer, step_size=max(1, int(epochs) // 3), gamma=0.1
+            opt, step_size=max(1, int(epochs) // 3), gamma=0.1
         )
     elif sched_kind == "plateau":
-        sched = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
+        sched = optim.lr_scheduler.ReduceLROnPlateau(opt, patience=5, factor=0.5)
     else:
         sched = None
 
@@ -791,25 +839,34 @@ def train_deep_classifier(
             idx = perm[i : i + batch_size]
             if len(idx) < 2 and batch_norm:
                 continue  # a trailing single-sample batch would break BatchNorm1d
-            optimizer.zero_grad()
+            opt.zero_grad()
             loss = criterion(model(X_t[idx]), y_t[idx])
             if not torch.isfinite(loss):
+                # Simply dividing the learning rate by ten is unreliable advice: from
+                # lr=9.9 that lands on 0.99, which limps to 0.63 accuracy, while 0.5
+                # diverges again and 0.1 trains cleanly. Recovery is not monotonic in lr,
+                # so the suggestion is clamped to a value known to be stable for the
+                # optimiser in use rather than merely "smaller than before".
+                safe_lr = 0.1 if optimizer_kind == "sgd" else 0.01
+                suggested = round(min(float(lr) / 10, safe_lr), 6)
                 return _err(
                     "nan_loss",
-                    f"Loss became {loss.item()} at epoch {epoch} with lr={lr}, "
-                    f"weight_decay={weight_decay}.",
-                    "Training diverged. Retry with a 10x smaller lr, and consider "
-                    "scheduler set to plateau.",
+                    f"Loss became {loss.item()} at epoch {epoch} using {optimizer_kind} "
+                    f"with lr={lr}, weight_decay={weight_decay}.",
+                    f"Training diverged. Retry with lr={suggested}. Enabling batch_norm "
+                    "also stabilises this configuration.",
                     {
                         "dataset_name": name,
                         "hidden_dims": hidden_dims,
                         "dropout": dropout,
+                        "batch_norm": batch_norm,
                         "epochs": epochs,
-                        "lr": round(float(lr) / 10, 6),
+                        "optimizer": optimizer_kind,
+                        "lr": suggested,
                     },
                 )
             loss.backward()
-            optimizer.step()
+            opt.step()
             epoch_loss += float(loss.item())
             n_batches += 1
 
@@ -824,7 +881,7 @@ def train_deep_classifier(
                 {
                     "epoch": epoch,
                     "loss": round(mean_loss, 4),
-                    "lr": round(float(optimizer.param_groups[0]["lr"]), 6),
+                    "lr": round(float(opt.param_groups[0]["lr"]), 6),
                 }
             )
     train_seconds = time.perf_counter() - start
@@ -851,6 +908,7 @@ def train_deep_classifier(
                 "batch_size": batch_size,
                 "scheduler": sched_kind,
                 "weight_decay": float(weight_decay),
+                "optimizer": optimizer_kind,
                 "seed": int(seed),
             },
             "final_loss": history[-1]["loss"] if history else None,
@@ -997,8 +1055,9 @@ TOOL_SPECS: Dict[str, Dict[str, Any]] = {
     },
     "train_deep_classifier": {
         "func": train_deep_classifier,
-        "description": "Train a deep PyTorch MLP with Dropout, BatchNorm and a learning-rate "
-                       "scheduler (cosine, step, plateau, none). Reports the generalisation gap.",
+        "description": "Train a deep PyTorch MLP with Dropout, BatchNorm, a learning-rate "
+                       "scheduler (cosine, step, plateau, none) and an optimizer (adam or "
+                       "sgd). Reports the generalisation gap.",
         "example": {"dataset_name": "breast_cancer", "hidden_dims": [64, 32],
                     "dropout": 0.3, "scheduler": "cosine"},
     },
