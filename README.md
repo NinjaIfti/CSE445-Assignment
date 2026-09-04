@@ -10,17 +10,25 @@ inside WSL2 reasons about a natural-language request, then drives Scikit-Learn a
 tools to answer it. No paid APIs, no data leaves the machine, and no agent framework — the
 Reason+Act loop is implemented from first principles.
 
+> ## 📦 GitHub Repository
+> ### **https://github.com/NinjaIfti/CSE445-Assignment**
+>
+> All code, execution logs and generated results are in this repository.
+> This document is both the repository README and the submitted technical report.
+
 ---
 
 ## Submission contents
 
+Repository root: **https://github.com/NinjaIfti/CSE445-Assignment**
+
 | Deliverable | Location |
 |---|---|
-| **Code** | [`ml_tools.py`](ml_tools.py), [`react_agent.py`](react_agent.py), [`benchmark_runner.py`](benchmark_runner.py), [`requirements.txt`](requirements.txt) |
-| **Execution logs** (≥3 required, 12 provided) | [`logs/TRACES_llama32-3b.md`](logs/TRACES_llama32-3b.md), [`logs/TRACES_mistral7b.md`](logs/TRACES_mistral7b.md) + per-run `.log`/`.json` |
-| **Technical report** | [Part II](#part-ii--technical-report) of this file |
-| Generated results | [`docs/BENCHMARK.md`](docs/BENCHMARK.md), [`docs/BENCHMARK_AGENT.md`](docs/BENCHMARK_AGENT.md), [`docs/LATENCY.md`](docs/LATENCY.md) |
-| Supporting detail | [`docs/APPENDIX.md`](docs/APPENDIX.md) |
+| **Code** | [`ml_tools.py`](https://github.com/NinjaIfti/CSE445-Assignment/blob/main/ml_tools.py) · [`react_agent.py`](https://github.com/NinjaIfti/CSE445-Assignment/blob/main/react_agent.py) · [`benchmark_runner.py`](https://github.com/NinjaIfti/CSE445-Assignment/blob/main/benchmark_runner.py) · [`requirements.txt`](https://github.com/NinjaIfti/CSE445-Assignment/blob/main/requirements.txt) |
+| **Execution logs** (≥3 required, 12 provided) | [`logs/TRACES_llama32-3b.md`](https://github.com/NinjaIfti/CSE445-Assignment/blob/main/logs/TRACES_llama32-3b.md) · [`logs/TRACES_mistral7b.md`](https://github.com/NinjaIfti/CSE445-Assignment/blob/main/logs/TRACES_mistral7b.md) · [all transcripts](https://github.com/NinjaIfti/CSE445-Assignment/tree/main/logs) |
+| **Technical report** | [Part II](#part-ii--technical-report) of this document |
+| Generated results | [`docs/BENCHMARK.md`](https://github.com/NinjaIfti/CSE445-Assignment/blob/main/docs/BENCHMARK.md) · [`docs/BENCHMARK_AGENT.md`](https://github.com/NinjaIfti/CSE445-Assignment/blob/main/docs/BENCHMARK_AGENT.md) · [`docs/LATENCY.md`](https://github.com/NinjaIfti/CSE445-Assignment/blob/main/docs/LATENCY.md) |
+| Supporting detail | [`docs/APPENDIX.md`](https://github.com/NinjaIfti/CSE445-Assignment/blob/main/docs/APPENDIX.md) |
 
 ### Task coverage
 
@@ -398,7 +406,7 @@ zero-variance differences; a grounding audit that let fabrications validate them
 `bool("false")` evaluating True, so `batch_norm=false` quietly trained *with* BatchNorm;
 and an optional colon in the `Action` header that let the prose "…retry the same Action
 with…" dispatch a tool named `with`. The full log is in
-[`docs/APPENDIX.md`](docs/APPENDIX.md) §10. That class of bug is the argument for running
+[`docs/APPENDIX.md`](https://github.com/NinjaIfti/CSE445-Assignment/blob/main/docs/APPENDIX.md) §10. That class of bug is the argument for running
 the real model early rather than after the code looks finished.
 
 **Environment:** Ubuntu 22.04.5 LTS on WSL2 (kernel 6.18.33.2-microsoft-standard-WSL2),
