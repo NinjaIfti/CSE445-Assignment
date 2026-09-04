@@ -51,7 +51,8 @@ echo "Kernel : $(uname -r)"
 say "1/6  Installing system packages"
 # --------------------------------------------------------------------------------------
 sudo apt-get update -qq
-sudo apt-get install -y -qq python3-pip python3-venv curl build-essential git
+# zstd is required by the Ollama install script, which ships zstd-compressed archives.
+sudo apt-get install -y -qq python3-pip python3-venv curl build-essential git zstd
 ok "python3 $(python3 --version | cut -d' ' -f2)"
 
 # --------------------------------------------------------------------------------------
